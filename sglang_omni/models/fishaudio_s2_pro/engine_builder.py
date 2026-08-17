@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang_omni.models.fishaudio_s2_pro import request_builders
 from sglang_omni.models.fishaudio_s2_pro import stages as fish_stages
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -23,6 +24,10 @@ _VALIDATED_AUTO_ATTENTION_BACKENDS = {
 
 
 def _resolve_fast_ar_attention_backend(*, gpu_id: int) -> str:
+    if current_platform.is_npu():
+        # Ascend NPU uses the built-in "ascend" attention backend.
+        return "ascend"
+
     sm_version = get_visible_gpu_sm_version(gpu_id)
     if sm_version is None:
         raise RuntimeError(
@@ -75,6 +80,18 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
         dtype: str,
     ) -> dict[str, Any]:
         del dtype
+        if current_platform.is_npu():
+            # NPU runs eager: CUDA graph and torch.compile are CUDA-validated only.
+            return {
+                "max_running_requests": 64,
+                "disable_cuda_graph": True,
+                "mem_fraction_static": 0.85,
+                "chunked_prefill_size": 8192,
+                "dtype": "bfloat16",
+                "enable_torch_compile": False,
+                "random_seed": int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF,
+            }
+
         sm_version = get_visible_gpu_sm_version(self.gpu_id)
         return {
             "max_running_requests": 64,
@@ -140,6 +157,8 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
         return fish_stages._resolve_s2pro_model_buffer_bs(model)
 
     def compile_model(self, model: Any, server_args: Any) -> None:
+        if current_platform.is_npu():
+            return
         if bool(server_args.enable_torch_compile):
             fish_stages._compile_s2pro_codebook_decoder(
                 model,
