@@ -81,6 +81,53 @@ def _flashinfer_kvcache_attention(
     return torch.stack(outputs, dim=0)
 
 
+def _npu_kvcache_attention(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    cache_position: int,
+) -> torch.Tensor:
+    """Torch-native Fast-AR attention fallback for Ascend NPU.
+
+    Mirrors the FlashInfer path's dense NHD KV semantics with
+    ``F.scaled_dot_product_attention``; torch_npu maps it to its fused
+    attention kernel. The Fast-AR cache window is at most
+    ``num_codebooks + 1`` tokens, so the eager fallback is cheap.
+    """
+    if k is None or v is None:
+        raise ValueError("NPU Fast-AR attention requires k and v")
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        raise ValueError("Fast-AR q, k, and v batch sizes must match")
+    if cache_position < 0:
+        raise ValueError("NPU Fast-AR attention requires cache_position")
+
+    cache_end = cache_position + int(k.shape[1])
+    k_cache[:, cache_position:cache_end].copy_(k)
+    v_cache[:, cache_position:cache_end].copy_(v)
+
+    # SDPA expects [bs, heads, seq, head_dim]; Fast-AR KV is NHD.
+    q_t = q.transpose(1, 2)
+    k_t = k_cache[:, :cache_end].transpose(1, 2)
+    v_t = v_cache[:, :cache_end].transpose(1, 2)
+    # Fast-AR decode feeds a single trailing query, so the causal mask must
+    # allow the whole populated prefix. torch's ``is_causal=True`` with
+    # q_len=1 and kv_len>1 only allows the first KV position (``tril``), which
+    # would attend to stale zeros; use an explicit offset causal mask instead.
+    q_len = q_t.shape[2]
+    kv_len = k_t.shape[2]
+    causal_mask = torch.tril(
+        torch.ones(q_len, kv_len, dtype=torch.bool, device=q_t.device),
+        diagonal=kv_len - q_len,
+    )
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q_t, k_t, v_t, attn_mask=causal_mask, is_causal=False
+    )
+    return out.transpose(1, 2)
+
+
 @torch.library.custom_op(
     "mylib::flash_attn_kvcache", mutates_args=("k_cache", "v_cache")
 )
@@ -95,6 +142,15 @@ def flash_attn_kvcache_op(
     num_splits: int = 0,
     cache_position: int = -1,
 ) -> torch.Tensor:
+    if q.device.type == "npu":
+        return _npu_kvcache_attention(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            cache_position=cache_position,
+        )
     if q.device.type != "cuda" or q.device.index is None:
         raise RuntimeError("FishAudio S2-Pro Fast-AR attention requires CUDA")
     if _fast_ar_uses_fa3(q.device.index):

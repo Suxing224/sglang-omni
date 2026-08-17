@@ -52,6 +52,25 @@ def fast_sampling_params(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def cuda_platform_for_engine_builder_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the engine-builder platform to non-NPU for SM-validated CUDA tests.
+
+    On Ascend hosts torch.npu is available, so current_platform resolves to
+    NPU and these CUDA SM-scope tests would route into the NPU branch instead
+    of the SM-validated path they assert on.
+    """
+    from sglang_omni.models.fishaudio_s2_pro import engine_builder as fish_engine
+
+    monkeypatch.setattr(
+        fish_engine,
+        "current_platform",
+        SimpleNamespace(is_npu=lambda: False),
+    )
+
+
 def test_fish_config_state_and_tokenizer_prompt_contracts() -> None:
     """Preserves S2-Pro topology, state tensor round-trip, and prompt VQ layout."""
     config = S2ProPipelineConfig(model_path="model")
