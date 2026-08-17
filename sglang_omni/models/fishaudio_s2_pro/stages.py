@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
+from sglang_omni.platforms import current_platform
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
@@ -168,9 +169,9 @@ class _FishReferenceEncodeHook(TensorReferenceEncodeHook[_FishReferenceInput]):
 
     def encode_one(self, item: _FishReferenceInput) -> torch.Tensor:
         if item.source_kind == "path":
-            import torchaudio
+            from sglang_omni.utils.audio import decode_audio_waveform
 
-            audio, sr = torchaudio.load(str(item.source))
+            audio, sr = decode_audio_waveform(str(item.source))
             return self._encode_reference_waveform(audio, int(sr))
         if item.source_kind in ("bytes", "base64"):
             from sglang_omni.preprocessing.audio import AudioMediaIO
@@ -305,7 +306,8 @@ def create_preprocessing_executor(
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
-    device: str = "cuda",
+    device: str | None = None,
+    gpu_id: int | None = None,
     max_new_tokens: int = 2048,
     top_k: int = 30,
     ras_window: int = 16,
@@ -313,6 +315,8 @@ def create_sglang_tts_engine_executor(
 ):
     """Returns OmniScheduler for the Fish TTS AR engine."""
     del top_k
+    if device is None:
+        device = _resolve_stage_device(gpu_id)
     from sglang_omni.models.fishaudio_s2_pro.engine_builder import (
         FishS2ProEngineBuilder,
     )
@@ -323,8 +327,16 @@ def create_sglang_tts_engine_executor(
     ).build(
         model_path,
         device=device,
+        gpu_id=gpu_id,
         server_args_overrides=server_args_overrides,
     )
+
+
+def _resolve_stage_device(gpu_id: int | None) -> str:
+    """Return the accelerator device string for a GPU-backed stage."""
+    if gpu_id is None:
+        return "cpu"
+    return f"{current_platform.device_type}:{gpu_id}"
 
 
 def create_vocoder_executor(
@@ -344,7 +356,7 @@ def create_vocoder_executor(
     )
 
     if device is None:
-        device = f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
+        device = _resolve_stage_device(gpu_id)
     checkpoint_dir = _resolve_checkpoint(model_path)
     codec = _load_codec(checkpoint_dir, device)
 

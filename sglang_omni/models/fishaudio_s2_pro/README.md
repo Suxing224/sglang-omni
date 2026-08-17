@@ -38,6 +38,19 @@ Text input ──► Preprocessing ──► SGLang AR Engine ──► DAC Voco
 
 Please refer to [TTS Model Usage](https://github.com/sgl-project/sglang-omni/blob/main/docs/basic_usage/tts.md) for more details.
 
+## Ascend NPU Support
+
+S2-Pro can run on Ascend NPU through the sglang-omni platform abstraction:
+
+- `attention_backend="ascend"` is selected automatically on NPU; Fast-AR uses a
+  torch-native `scaled_dot_product_attention` fallback over its dense NHD KV
+  cache (no FlashInfer / sgl_kernel dependency).
+- CUDA graphs and the owned `torch.compile` path are disabled on NPU; decode
+  runs eager.
+- Cross-process payloads use SHM transport instead of CUDA IPC.
+- The standard `sgl-omni serve --config examples/configs/s2pro_tts.yaml` command
+  works unchanged; device strings are resolved from `current_platform.device_type`.
+
 ## Optimizations with SGLang Omni
 
 By integrating S2's Dual-AR backbone into SGLang's paged-attention engine, we inherit LLM-native optimizations:

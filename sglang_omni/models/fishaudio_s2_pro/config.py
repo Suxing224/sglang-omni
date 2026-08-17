@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.platforms import current_platform
 
 _PKG = "sglang_omni.models.fishaudio_s2_pro"
 
@@ -52,7 +53,10 @@ class S2ProPipelineConfig(PipelineConfig):
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"device": "cuda:0", "max_new_tokens": 2048},
+            factory_args={
+                "device": f"{current_platform.device_type}:0",
+                "max_new_tokens": 2048,
+            },
             gpu=0,
             next="vocoder",
             stream_to=["vocoder"],
