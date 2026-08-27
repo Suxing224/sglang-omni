@@ -164,16 +164,16 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     from sglang_omni.models.fishaudio_s2_pro import streaming_vocoder
     from sglang_omni.platforms import current_platform
 
-    # The tts_engine stage default is platformized at import time.
+    # The tts_engine stage resolves device=None via resolve_device_spec.
     default = inspect.signature(
         fish_stages.create_sglang_tts_engine_executor
     ).parameters["device"].default
-    assert default == f"{current_platform.device_type}:0"
+    assert default is None
 
-    # The vocoder stage resolves device=None from gpu_id via the platform.
+    # The vocoder stage resolves device=None from gpu_id via resolve_device_spec.
     seen: list[str] = []
     monkeypatch.setattr(
-        fish_stages, "current_platform", SimpleNamespace(device_type="npu")
+        fish_stages, "resolve_device_spec", lambda device, index: f"npu:{index}" if index is not None else "cpu"
     )
     monkeypatch.setattr(fish_stages, "_resolve_checkpoint", lambda model_path: "ckpt")
     monkeypatch.setattr(
@@ -192,7 +192,7 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     assert seen[-1] == "cpu"
 
     monkeypatch.setattr(
-        fish_stages, "current_platform", SimpleNamespace(device_type="cuda")
+        fish_stages, "resolve_device_spec", lambda device, index: f"cuda:{index}" if index is not None else "cpu"
     )
     fish_stages.create_vocoder_executor("model", device=None, gpu_id=0)
     assert seen[-1] == "cuda:0"

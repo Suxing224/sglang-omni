@@ -28,6 +28,7 @@ from sglang_omni.scheduling.reference_encoder import (
     TensorReferenceEncodeHook,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
+from sglang_omni.utils.device import resolve_device_spec
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +307,7 @@ def create_preprocessing_executor(
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
-    device: str = f"{current_platform.device_type}:0",
+    device: str | None = None,
     max_new_tokens: int = 2048,
     top_k: int = 30,
     ras_window: int = 16,
@@ -314,6 +315,8 @@ def create_sglang_tts_engine_executor(
 ):
     """Returns OmniScheduler for the Fish TTS AR engine."""
     del top_k
+    if device is None:
+        device = resolve_device_spec(None, 0)
     from sglang_omni.models.fishaudio_s2_pro.engine_builder import (
         FishS2ProEngineBuilder,
     )
@@ -345,7 +348,7 @@ def create_vocoder_executor(
     )
 
     if device is None:
-        device = f"{current_platform.device_type}:{gpu_id}" if gpu_id is not None else "cpu"
+        device = resolve_device_spec(None, gpu_id)
     checkpoint_dir = _resolve_checkpoint(model_path)
     codec = _load_codec(checkpoint_dir, device)
 
