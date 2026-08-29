@@ -39,6 +39,25 @@ _QWEN_TTS_INSTALL_HINT = (
     "docs/cookbook/qwen3_tts.md."
 )
 
+_NPU_UNSUPPORTED_ATTN_IMPLEMENTATIONS = frozenset(
+    {"flash_attention_2", "flash_attention_3", "flash_attention_4"}
+)
+
+
+def _resolve_qwen3_tts_attn_implementation(
+    device: str | torch.device,
+    attn_implementation: str | None,
+) -> str | None:
+    device_type = str(device).strip().partition(":")[0].lower()
+    if device_type != "npu":
+        return attn_implementation
+    if attn_implementation in _NPU_UNSUPPORTED_ATTN_IMPLEMENTATIONS:
+        raise ValueError(
+            "Qwen3-TTS speech tokenizer cannot use "
+            f"attn_implementation={attn_implementation!r} on NPU; use 'sdpa'"
+        )
+    return attn_implementation or "sdpa"
+
 
 def _load_qwen3_tts_tokenizer(
     model_path: str,
@@ -53,6 +72,9 @@ def _load_qwen3_tts_tokenizer(
     except ImportError as exc:
         raise RuntimeError(_QWEN_TTS_INSTALL_HINT) from exc
 
+    attn_implementation = _resolve_qwen3_tts_attn_implementation(
+        device, attn_implementation
+    )
     checkpoint_dir = _resolve_checkpoint(model_path)
     tokenizer_path = os.path.join(checkpoint_dir, "speech_tokenizer")
     torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
@@ -63,7 +85,13 @@ def _load_qwen3_tts_tokenizer(
     if attn_implementation is not None:
         kwargs["attn_implementation"] = attn_implementation
 
-    logger.info(f"Loading Qwen3-TTS speech tokenizer from {tokenizer_path} on {device}")
+    logger.info(
+        "Loading Qwen3-TTS speech tokenizer from %s on %s "
+        "with attn_implementation=%s",
+        tokenizer_path,
+        device,
+        attn_implementation or "upstream-default",
+    )
     return Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
 
 
@@ -159,6 +187,7 @@ def create_vocoder_executor(
     initial_chunk_frames: int | None = None,
     stream_chunk_ramp: tuple[int, ...] | list[int] | None = None,
     stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
+    async_decode: bool | None = None,
     initial_max_batch_size: int = 32,
     initial_batch_wait_ms: int = 2,
     followup_max_batch_size: int = 8,
@@ -187,6 +216,7 @@ def create_vocoder_executor(
         stream_left_context_frames=stream_left_context_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        async_decode=async_decode,
         initial_max_batch_size=initial_max_batch_size,
         initial_batch_wait_ms=initial_batch_wait_ms,
         followup_max_batch_size=followup_max_batch_size,

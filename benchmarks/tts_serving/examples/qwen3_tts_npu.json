@@ -1,0 +1,30 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "model_name": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "test_type": "engine",
+  "seed": 0,
+  "params": {
+    "profile": "stress",
+    "enabled_endpoints": [
+      "speech",
+      "speech_stream"
+    ],
+    "file_ref_audio": "file:docs/_static/audio/male-voice.wav",
+    "file_ref_text": "Hey, Adam here. Let's create something that feels real, sounds human, and connects every time.",
+    "load_stages": [
+      {
+        "id": "closed-loop-c8",
+        "mode": "closed_loop",
+        "request_count": 64,
+        "max_concurrency": 8
+      },
+      {
+        "id": "soak-30m-c8",
+        "mode": "soak",
+        "request_count": 180,
+        "duration_s": 1800,
+        "max_concurrency": 8
+      }
+    ]
+  }
+}

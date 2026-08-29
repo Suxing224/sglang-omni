@@ -347,7 +347,7 @@ class _Qwen3TTSInitialDecodeGraphs:
 class Qwen3TTSStreamingVocoderScheduler(
     StreamingVocoderBase[_Qwen3TTSStreamState, None]
 ):
-    """Decode Qwen3-TTS codec frames on a priority CUDA stream."""
+    """Decode Qwen3-TTS codec frames with platform-aware execution policy."""
 
     def __init__(
         self,
@@ -520,6 +520,18 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             self._decode_stream = None
             self._followup_decode_stream = None
+        if self._device.type != "cuda":
+            execution_mode = f"{self._device.type}-eager-sync"
+        elif self._async_decode:
+            execution_mode = "cuda-async"
+        else:
+            execution_mode = "cuda-sync"
+        logger.info(
+            "Qwen3-TTS vocoder execution mode=%s, cuda_graph=%s/%s",
+            execution_mode,
+            self._initial_decode_graphs._enabled,
+            self._followup_decode_graphs._enabled,
+        )
         self._initial_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None] = (
             queue.Queue()
         )
@@ -684,7 +696,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 f"Qwen3-TTS stream chunk has {int(chunk.shape[1])} quantizers, "
                 f"expected {state.num_quantizers}"
             )
-        if not chunk.is_cuda and (
+        if chunk.device.type == "cpu" and (
             bool((chunk < 0).any()) or bool((chunk >= _QWEN3_TTS_CODEBOOK_SIZE).any())
         ):
             raise ValueError(
@@ -899,9 +911,9 @@ class Qwen3TTSStreamingVocoderScheduler(
 
     def _screen_out_of_range_codes(self, decoder_input: torch.Tensor) -> Any:
         # Note (Jiaxin Deng): an out-of-range id makes the codec embedding lookup
-        # raise a device-side assert, which poisons the CUDA context and kills
-        # every in-flight stream in this process; validate_chunk cannot catch it
-        # because it skips device tensors. Clamp into range so the lookup is
+        # raise a device-side error, which may poison the accelerator context and
+        # kill every in-flight stream in this process; validate_chunk only checks
+        # CPU tensors synchronously. Clamp into range so the lookup is
         # always safe, and return the per-row verdict: the CPU and deterministic
         # multi-plan paths check it before decoding, the async CUDA path reads it
         # back inside ``resolve()`` once the completion event has fired, so no

@@ -77,6 +77,39 @@ def _sample_seeded_categorical(
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
+def _predictor_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    num_kv_groups: int,
+    expand_gqa: bool,
+) -> torch.Tensor:
+    if num_kv_groups == 1:
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=False,
+        )
+    if expand_gqa:
+        key = key.repeat_interleave(num_kv_groups, dim=1)
+        value = value.repeat_interleave(num_kv_groups, dim=1)
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=False,
+        )
+    return torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=False,
+        enable_gqa=True,
+    )
+
+
 class _PredictorDecodeGraph:
     """CUDA graph over the full per-token predictor chain for one batch bucket.
 
@@ -1275,6 +1308,8 @@ class Qwen3TTSTalker(nn.Module):
     def _resolve_predictor_graph_enabled(self) -> bool:
         if not _predictor_graph_env_enabled():
             return False
+        if self._predictor_input_buffer.device.type != "cuda":
+            return False
         server_args = get_global_server_args()
         if bool(server_args.disable_cuda_graph):
             return False
@@ -1798,21 +1833,13 @@ class Qwen3TTSTalker(nn.Module):
         cached_k = layer_k_cache[:, :, : cache_len + 1, :]
         cached_v = layer_v_cache[:, :, : cache_len + 1, :]
         num_kv_groups = attn.num_heads // attn.num_kv_heads
-        if num_kv_groups == 1:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
-            )
-        else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
-                enable_gqa=True,
-            )
+        attn_output = _predictor_scaled_dot_product_attention(
+            q,
+            cached_k,
+            cached_v,
+            num_kv_groups=num_kv_groups,
+            expand_gqa=q.device.type == "npu",
+        )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
         )

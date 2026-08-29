@@ -14,8 +14,9 @@ class NPUOmniPlatform(OmniPlatform):
     def get_device(self, local_rank: int) -> "torch.device":
         return torch.device("npu", local_rank)
 
-    def set_device(self, device: "torch.device") -> None:
-        torch.npu.set_device(device)
+    def set_device(self, device: "torch.device | int") -> None:
+        index = device.index if isinstance(device, torch.device) else int(device)
+        torch.npu.set_device(0 if index is None else index)
 
     def enable_code2wav_graph(self):
         return False

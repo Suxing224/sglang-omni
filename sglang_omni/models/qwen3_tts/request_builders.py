@@ -696,6 +696,21 @@ class _Qwen3TTSRefCodeBatcher:
         }
         for device in cuda_devices:
             torch.cuda.current_stream(device).synchronize()
+        npu_devices = {
+            outcome.device
+            for outcome in outcomes.values()
+            if not isinstance(outcome, Exception)
+            and getattr(getattr(outcome, "device", None), "type", None) == "npu"
+        }
+        if npu_devices:
+            npu = getattr(torch, "npu", None)
+            if npu is None:
+                raise RuntimeError(
+                    "Qwen3-TTS reference encoding produced NPU tensors, but "
+                    "torch.npu is unavailable"
+                )
+            for device in npu_devices:
+                npu.synchronize(device)
 
     def _run(self) -> None:
         while True:

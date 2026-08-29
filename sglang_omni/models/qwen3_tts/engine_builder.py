@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
 
@@ -19,6 +20,10 @@ def _is_truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return False
+
+
+def _is_npu_platform() -> bool:
+    return getattr(current_platform, "device_type", None) == "npu"
 
 
 class Qwen3TtsEngineBuilder(TtsEngineBuilder):
@@ -52,7 +57,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         *,
         dtype: str,
     ) -> dict[str, Any]:
-        return {
+        defaults = {
             "max_running_requests": 16,
             "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
@@ -66,6 +71,13 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
         }
+        if _is_npu_platform():
+            defaults.update(
+                disable_cuda_graph=True,
+                enable_torch_compile=False,
+                torch_compile_max_bs=1,
+            )
+        return defaults
 
     def setup_model(
         self,

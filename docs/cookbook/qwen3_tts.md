@@ -79,6 +79,37 @@ sgl-omni serve \
   --port 8000
 ```
 
+### Ascend NPU baseline
+
+The NPU configurations start from a conservative, single-request correctness
+baseline. The Talker uses SGLang's `ascend` attention backend, both Speech
+Tokenizer instances use PyTorch SDPA, and CUDA Graph, private Talker compile,
+and asynchronous vocoder decode stay disabled.
+
+```bash
+# 0.6B Base
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --config examples/configs/qwen3_tts_0_6b_npu.yaml \
+  --port 8000
+```
+
+Use `qwen3_tts_1_7b_npu.yaml`, `qwen3_tts_0_6b_customvoice_npu.yaml`, or
+`qwen3_tts_1_7b_voicedesign_npu.yaml` for the other supported checkpoints.
+The 0.6B and 1.7B files intentionally have separate `mem_fraction_static`
+starting values. Calibrate each checkpoint on the target NPU before increasing
+`max_running_requests` or any vocoder batch limit.
+
+To run the serving stability workload against an already running 0.6B Base
+server:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_serving \
+  --spec benchmarks/tts_serving/examples/qwen3_tts_npu.json \
+  --use-existing-server \
+  --output-dir benchmark-results/qwen3-tts-npu
+```
+
 ### Deterministic Inference
 
 Dynamic batching can change Qwen3-TTS codec and waveform outputs even when the

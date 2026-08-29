@@ -11,10 +11,12 @@ from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 
 import sglang_omni.platforms as platforms
+import sglang_omni.platforms.npu as npu_platform
 import sglang_omni.platforms.xpu as xpu_platform
 from sglang_omni.platforms.cpu import CPUOmniPlatform
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.interface import OmniPlatform
+from sglang_omni.platforms.npu import NPUOmniPlatform
 from sglang_omni.platforms.rocm import ROCMOmniPlatform
 from sglang_omni.platforms.xpu import XPUOmniPlatform
 
@@ -132,6 +134,31 @@ def test_xpu_set_device_accepts_an_index_or_a_device(
     )
 
     XPUOmniPlatform().set_device(argument)
+
+    assert seen == [expected_index]
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected_index"),
+    [
+        (2, 2),
+        (torch.device("cuda", 3), 3),
+        (torch.device("cuda", 0), 0),
+        (torch.device("cuda"), 0),
+    ],
+)
+def test_npu_set_device_accepts_an_index_or_a_device(
+    monkeypatch, argument, expected_index
+) -> None:
+    seen: list[int] = []
+    monkeypatch.setattr(
+        npu_platform.torch,
+        "npu",
+        SimpleNamespace(set_device=seen.append),
+        raising=False,
+    )
+
+    NPUOmniPlatform().set_device(argument)
 
     assert seen == [expected_index]
 
