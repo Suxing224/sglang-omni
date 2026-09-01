@@ -34,6 +34,7 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
+    sample_from_logprobs_with_seed_npu,
     sample_from_sorted_logprobs_with_seed_small_k,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
@@ -74,6 +75,9 @@ def _sample_seeded_categorical(
     seeds: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
+    sampled = sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
+    if sampled is not None:
+        return sampled
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
