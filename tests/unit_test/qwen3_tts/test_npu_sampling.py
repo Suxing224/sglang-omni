@@ -133,6 +133,14 @@ def test_npu_sampling_dispatch_does_not_capture_cpu() -> None:
     assert sampled is None
 
 
+def test_cuda_triton_kernel_is_disabled_for_non_cuda_pytorch(monkeypatch) -> None:
+    monkeypatch.setattr(sampling_kernels, "triton", object())
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+
+    assert not sampling_kernels._has_cuda_or_rocm_triton_runtime()
+
+
 def test_sorted_sampler_uses_float32_path_for_npu(monkeypatch) -> None:
     monkeypatch.setattr(
         sampling_kernels,
@@ -158,6 +166,8 @@ def test_sglang_seeded_sampler_patch_uses_npu_float32_path(monkeypatch) -> None:
         original_calls.append((logprobs, seeds, positions))
         return torch.zeros((logprobs.shape[0], 1), dtype=torch.long)
 
+    original._is_torch_compile = True
+    original._torchdynamo_orig_callable = original
     sampler_module = SimpleNamespace(multinomial_with_seed=original)
     monkeypatch.setattr(
         sampling_kernels,
@@ -177,6 +187,8 @@ def test_sglang_seeded_sampler_patch_uses_npu_float32_path(monkeypatch) -> None:
     )
 
     assert sampler_module.multinomial_with_seed is patched
+    assert not hasattr(patched, "_is_torch_compile")
+    assert not hasattr(patched, "_torchdynamo_orig_callable")
     assert sampled.tolist() == [[1], [1]]
     assert original_calls == []
 
