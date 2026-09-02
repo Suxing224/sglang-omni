@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from functools import wraps
+
 import torch
 
 try:
@@ -539,12 +541,53 @@ def sample_from_logprobs_with_seed_npu(
     return _seeded_gumbel_argmax_float32(logprobs, seeds, positions)
 
 
+def patch_sglang_multinomial_with_seed_for_npu(sampler_module: object) -> None:
+    """Route SGLang seeded sampling around its float64 path on NPU."""
+    original = getattr(sampler_module, "multinomial_with_seed")
+    if getattr(original, "_qwen3_tts_npu_safe", False):
+        return
+
+    @wraps(original)
+    def npu_safe_multinomial_with_seed(
+        logprobs: torch.Tensor,
+        seeds: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        sampled = sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
+        if sampled is not None:
+            return sampled.view(-1, 1)
+        return original(logprobs, seeds, positions)
+
+    setattr(npu_safe_multinomial_with_seed, "_qwen3_tts_npu_safe", True)
+    setattr(sampler_module, "multinomial_with_seed", npu_safe_multinomial_with_seed)
+
+
+def _all_tensors_on_npu(*tensors: torch.Tensor) -> bool:
+    return all(tensor.device.type == "npu" for tensor in tensors)
+
+
 def sample_from_sorted_logprobs_with_seed_small_k(
     logprobs: torch.Tensor,
     sorted_idx: torch.Tensor,
     seeds: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor | None:
+    if _all_tensors_on_npu(logprobs, sorted_idx, seeds, positions):
+        if logprobs.ndim != 2 or sorted_idx.shape != logprobs.shape:
+            return None
+        if seeds.ndim != 1 or positions.ndim != 1:
+            return None
+        batch_size, num_cols = logprobs.shape
+        if batch_size == 0:
+            return torch.empty((0,), device=logprobs.device, dtype=torch.long)
+        if seeds.shape[0] != batch_size or positions.shape[0] != batch_size:
+            return None
+        if num_cols <= 0:
+            return None
+
+        sampled_rank = _seeded_gumbel_argmax_float32(logprobs, seeds, positions)
+        return sorted_idx.gather(1, sampled_rank.unsqueeze(1)).view(-1)
+
     if (
         _seeded_gumbel_sample_sorted_kernel is None
         or not logprobs.is_cuda

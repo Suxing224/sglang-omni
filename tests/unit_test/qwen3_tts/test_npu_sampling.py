@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -130,3 +131,76 @@ def test_npu_sampling_dispatch_does_not_capture_cpu() -> None:
     )
 
     assert sampled is None
+
+
+def test_sorted_sampler_uses_float32_path_for_npu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sampling_kernels,
+        "_all_tensors_on_npu",
+        lambda *tensors: True,
+    )
+
+    sampled = sampling_kernels.sample_from_sorted_logprobs_with_seed_small_k(
+        torch.tensor([[-100.0, 0.0]], dtype=torch.float32),
+        torch.tensor([[7, 9]], dtype=torch.long),
+        torch.tensor([0], dtype=torch.int64),
+        torch.tensor([1_707_985_137], dtype=torch.int64),
+    )
+
+    assert sampled is not None
+    assert sampled.tolist() == [9]
+
+
+def test_sglang_seeded_sampler_patch_uses_npu_float32_path(monkeypatch) -> None:
+    original_calls = []
+
+    def original(logprobs, seeds, positions):
+        original_calls.append((logprobs, seeds, positions))
+        return torch.zeros((logprobs.shape[0], 1), dtype=torch.long)
+
+    sampler_module = SimpleNamespace(multinomial_with_seed=original)
+    monkeypatch.setattr(
+        sampling_kernels,
+        "sample_from_logprobs_with_seed_npu",
+        lambda logprobs, seeds, positions: torch.ones(
+            (logprobs.shape[0],), dtype=torch.long
+        ),
+    )
+
+    sampling_kernels.patch_sglang_multinomial_with_seed_for_npu(sampler_module)
+    patched = sampler_module.multinomial_with_seed
+    sampling_kernels.patch_sglang_multinomial_with_seed_for_npu(sampler_module)
+    sampled = sampler_module.multinomial_with_seed(
+        torch.zeros((2, 3)),
+        torch.tensor([11, 22]),
+        torch.tensor([4, 8]),
+    )
+
+    assert sampler_module.multinomial_with_seed is patched
+    assert sampled.tolist() == [[1], [1]]
+    assert original_calls == []
+
+
+def test_sglang_seeded_sampler_patch_preserves_non_npu_path(monkeypatch) -> None:
+    original_calls = []
+
+    def original(logprobs, seeds, positions):
+        original_calls.append((logprobs, seeds, positions))
+        return torch.zeros((logprobs.shape[0], 1), dtype=torch.long)
+
+    sampler_module = SimpleNamespace(multinomial_with_seed=original)
+    monkeypatch.setattr(
+        sampling_kernels,
+        "sample_from_logprobs_with_seed_npu",
+        lambda logprobs, seeds, positions: None,
+    )
+
+    sampling_kernels.patch_sglang_multinomial_with_seed_for_npu(sampler_module)
+    sampled = sampler_module.multinomial_with_seed(
+        torch.zeros((1, 2)),
+        torch.tensor([5]),
+        torch.tensor([7]),
+    )
+
+    assert sampled.tolist() == [[0]]
+    assert len(original_calls) == 1

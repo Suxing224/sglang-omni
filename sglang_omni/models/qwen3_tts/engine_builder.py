@@ -8,6 +8,9 @@ from typing import Any
 
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
+from sglang_omni.models.qwen3_tts.sampling_kernels import (
+    patch_sglang_multinomial_with_seed_for_npu,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
@@ -51,6 +54,10 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         del checkpoint_dir
         qwen3_stages.apply_qwen_tts_transformers_compatibility_patches()
         qwen3_stages._register_qwen3_tts_hf_config()
+        if _is_npu_platform():
+            from sglang.srt.layers import sampler as sglang_sampler
+
+            patch_sglang_multinomial_with_seed_for_npu(sglang_sampler)
 
     def generation_defaults(
         self,
