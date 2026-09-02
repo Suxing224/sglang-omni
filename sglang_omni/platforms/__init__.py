@@ -48,9 +48,14 @@ def _load_platform_class(qualname: str) -> type[OmniPlatform]:
         return cls
     if not issubclass(cls, SRTPlatform):
         raise TypeError(f"Expected an SRTPlatform subclass: {qualname}")
+    omni_base = (
+        NPUOmniPlatform
+        if getattr(cls, "device_type", None) == "npu"
+        else OmniPlatform
+    )
     return type(
         f"Omni{cls.__name__}",
-        (cls, OmniPlatform),
+        (cls, omni_base),
         {"_omni_platform_qualname": qualname},
     )
 

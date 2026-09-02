@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -23,6 +24,14 @@ _SPEC.loader.exec_module(sampling_kernels)
 
 
 _UINT32_MASK = 0xFFFFFFFF
+
+
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
 
 
 def _rotl32(value: int, shift: int) -> int:
@@ -121,6 +130,54 @@ def test_float32_seeded_sampling_caps_maximum_hash_uniform() -> None:
     )
 
     assert sampled.item() == 1
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+def test_npu_murmur_hash_and_float32_gumbel_execute_on_device() -> None:
+    device = torch.device("npu:0")
+    seeds = torch.tensor([0, 17, -1], device=device, dtype=torch.int64)
+    positions = torch.tensor(
+        [1_707_985_137, 3, 9], device=device, dtype=torch.int64
+    )
+
+    hashes = sampling_kernels._murmur_hash32_pytorch(seeds, positions, 4)
+    sampled = sampling_kernels._seeded_gumbel_argmax_float32(
+        torch.tensor(
+            [[0.0, -1.0, -2.0, -3.0]] * 3,
+            device=device,
+            dtype=torch.float32,
+        ),
+        seeds,
+        positions,
+    )
+    torch.npu.synchronize(device)
+
+    expected_hashes = torch.tensor(
+        [
+            [_reference_hash(seed, position, column) for column in range(4)]
+            for seed, position in zip(seeds.cpu().tolist(), positions.cpu().tolist())
+        ],
+        dtype=torch.int64,
+    )
+    torch.testing.assert_close(hashes.cpu(), expected_hashes, rtol=0, atol=0)
+    assert sampled.device.type == "npu"
+    assert sampled.shape == (3,)
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+def test_sorted_seeded_sampler_executes_float32_path_on_npu() -> None:
+    device = torch.device("npu:0")
+    sampled = sampling_kernels.sample_from_sorted_logprobs_with_seed_small_k(
+        torch.tensor([[-100.0, 0.0]], device=device, dtype=torch.float32),
+        torch.tensor([[7, 9]], device=device, dtype=torch.long),
+        torch.tensor([0], device=device, dtype=torch.int64),
+        torch.tensor([1_707_985_137], device=device, dtype=torch.int64),
+    )
+    torch.npu.synchronize(device)
+
+    assert sampled is not None
+    assert sampled.device.type == "npu"
+    assert sampled.cpu().tolist() == [9]
 
 
 def test_npu_sampling_dispatch_does_not_capture_cpu() -> None:

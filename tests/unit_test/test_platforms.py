@@ -37,6 +37,16 @@ class _VendorSRTPlatform(SRTPlatform, _VendorDeviceMixin):
     pass
 
 
+class _VendorNpuDeviceMixin(DeviceMixin):
+    _enum = PlatformEnum.NPU
+    device_name = "npu"
+    device_type = "npu"
+
+
+class _VendorNpuSRTPlatform(SRTPlatform, _VendorNpuDeviceMixin):
+    pass
+
+
 def test_npu_probe_handles_torch_without_npu(monkeypatch) -> None:
     monkeypatch.delattr(torch, "npu", raising=False)
 
@@ -111,6 +121,18 @@ def test_srt_plugin_identity_round_trips_to_spawned_process() -> None:
     assert isinstance(restored, OmniPlatform)
     assert restored.get_device(2) == "vendor:2"
     assert restored.get_stage_process_env(SimpleNamespace(), {}) == {}
+
+
+def test_npu_plugin_keeps_omni_npu_capabilities_after_round_trip() -> None:
+    qualname = f"{__name__}._VendorNpuSRTPlatform"
+    platform = platforms._load_platform_class(qualname)()
+    restored = platforms._load_platform_class(platforms.get_platform_spec(platform))()
+
+    assert platform.device_type == "npu"
+    assert platform.enable_code2wav_graph() is False
+    assert platform.supports_torchaudio_resample() is False
+    assert restored.enable_code2wav_graph() is False
+    assert restored.supports_torchaudio_resample() is False
 
 
 @pytest.mark.parametrize(
