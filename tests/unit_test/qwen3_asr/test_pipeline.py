@@ -16,6 +16,7 @@ import sglang_omni.scheduling.bootstrap as bootstrap
 import sglang_omni.scheduling.omni_scheduler as omni_scheduler
 import sglang_omni.scheduling.sglang_backend as sglang_backend
 import sglang_omni.utils.cuda_graph_batch_validator as cuda_graph_batch_validator
+import sglang_omni.utils.device as device_utils
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from sglang_omni.models.qwen3_asr import request_builders
@@ -26,7 +27,15 @@ from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
-from tests.unit_test.fakes import FakeServerArgs
+
+
+@pytest.fixture(autouse=True)
+def _select_non_mlx_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sglang.srt.utils.tensor_bridge as tensor_bridge
+
+    # Backend-specific tests opt into MLX explicitly. Keep CUDA/ROCm/Torch MPS
+    # profile tests independent of the caller's SGLANG_USE_MLX environment.
+    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: False)
 
 
 def _fake_server_args_builder(build_kwargs: dict[str, object]):
@@ -46,7 +55,7 @@ def _fake_server_args_builder(build_kwargs: dict[str, object]):
             ("moe_a2a_backend", "none"),
         ):
             flat.setdefault(name, default)
-        server_args = FakeServerArgs(context_length=context_length, **flat)
+        server_args = SimpleNamespace(context_length=context_length, **flat)
         prefill_bs = overrides.get("cuda_graph_bs_prefill")
         server_args.cuda_graph_config = SimpleNamespace(
             decode=SimpleNamespace(
@@ -212,6 +221,52 @@ def test_qwen3_asr_explicit_prefill_backend_overrides_rocm_default(
     assert overrides["prefill_attention_backend"] == "aiter"
 
 
+def test_qwen3_asr_torch_mps_uses_eager_native_profile() -> None:
+    from sglang.srt.utils.tensor_bridge import use_mlx
+
+    if use_mlx():
+        pytest.skip("Torch MPS profile requires SGLANG_USE_MLX=0")
+    builder = _make_engine_builder()
+    builder.device = "mps"
+
+    defaults = builder.generation_defaults(dtype="float16")
+
+    assert defaults == {
+        "max_running_requests": 1,
+        "disable_cuda_graph": True,
+        "disable_overlap_schedule": True,
+        "disable_radix_cache": True,
+        "enable_torch_compile": False,
+        "context_length": 2048,
+        "max_total_tokens": 2048,
+        "max_prefill_tokens": 2048,
+        "chunked_prefill_size": -1,
+        "mem_fraction_static": None,
+        "attention_backend": "torch_native",
+        "mm_attention_backend": "sdpa",
+        "sampling_backend": "pytorch",
+        "dtype": "float16",
+    }
+
+
+def test_qwen3_asr_mlx_profile_overrides_typed_torch_compile_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sglang.srt.utils.tensor_bridge as tensor_bridge
+
+    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: True)
+    monkeypatch.setattr(qwen3_asr_builder.current_platform, "is_mps", lambda: True)
+    builder = _make_engine_builder()
+    builder.device = "mps"
+    overrides = {"enable_torch_compile": True}
+
+    defaults = builder.generation_defaults(dtype="auto")
+    builder.adjust_overrides(overrides)
+
+    assert defaults["enable_torch_compile"] is False
+    assert overrides["enable_torch_compile"] is False
+
+
 def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
 
@@ -359,6 +414,11 @@ def _patch_engine_dependencies(
         stream_output_builder=object(),
         stream_builder_calls=[],
     )
+    monkeypatch.setattr(
+        device_utils,
+        "resolve_device_spec",
+        lambda device, gpu_id: f"cuda:{gpu_id or 0}",
+    )
 
     monkeypatch.setattr(
         qwen3_asr_builder.AutoTokenizer,
@@ -442,8 +502,6 @@ def _patch_engine_dependencies(
         )
         return want_cuda_graph, (
             model_worker,
-            object(),
-            object(),
             object(),
             object(),
             object(),
