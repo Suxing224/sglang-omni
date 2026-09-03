@@ -82,7 +82,8 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
         del dtype
         if current_platform.is_npu():
             # NPU graph decode avoids the ascend backend's eager concurrent-
-            # decode content corruption; lower mem_fraction for prefill headroom.
+            # decode content corruption. Limit concurrency to the validated NPU
+            # level and lower mem_fraction for prefill headroom.
             return {
                 "max_running_requests": 16,
                 "disable_cuda_graph": False,
@@ -163,8 +164,6 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
         return fish_stages._resolve_s2pro_model_buffer_bs(model)
 
     def compile_model(self, model: Any, server_args: Any) -> None:
-        if current_platform.is_npu():
-            return
         if bool(server_args.enable_torch_compile):
             fish_stages._compile_s2pro_codebook_decoder(
                 model,

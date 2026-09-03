@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -13,14 +14,28 @@ from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic import
 )
 
 
-def test_npu_kvcache_attention_matches_dense_sdpa() -> None:
-    bs, seq_q, n_heads, head_dim, cache_len = 2, 1, 4, 8, 11
-    q = torch.randn(bs, seq_q, n_heads, head_dim)
-    k = torch.randn(bs, seq_q, n_heads, head_dim)
-    v = torch.randn(bs, seq_q, n_heads, head_dim)
-    k_cache = torch.zeros(bs, cache_len, n_heads, head_dim)
-    v_cache = torch.zeros(bs, cache_len, n_heads, head_dim)
-    cache_position = 3
+def test_npu_kvcache_attention_uses_fused_infer_attention(
+    monkeypatch,
+) -> None:
+    q = torch.randn(2, 1, 4, 8)
+    k = torch.randn(2, 1, 4, 8)
+    v = torch.randn(2, 1, 4, 8)
+    k_cache = torch.zeros(2, 11, 4, 8)
+    v_cache = torch.zeros(2, 11, 4, 8)
+    calls = []
+
+    def fake_fused_attention(query, key, value, **kwargs):
+        calls.append((query, key, value, kwargs))
+        return torch.full_like(query, 7), torch.empty(0)
+
+    monkeypatch.setattr(
+        fish_audio_decoder.torch.ops,
+        "npu",
+        SimpleNamespace(
+            npu_fused_infer_attention_score=fake_fused_attention,
+        ),
+        raising=False,
+    )
 
     out = fish_audio_decoder._npu_kvcache_attention(
         q=q,
@@ -28,62 +43,86 @@ def test_npu_kvcache_attention_matches_dense_sdpa() -> None:
         v_cache=v_cache,
         k=k,
         v=v,
-        cache_position=cache_position,
+        cache_position=3,
     )
 
-    assert out.shape == q.shape
-    assert torch.equal(k_cache[:, cache_position : cache_position + 1], k)
-    assert torch.equal(v_cache[:, cache_position : cache_position + 1], v)
+    assert torch.equal(out, torch.full_like(q, 7))
+    assert torch.equal(k_cache[:, 3:4], k)
+    assert torch.equal(v_cache[:, 3:4], v)
+    assert len(calls) == 1
+    query, key, value, kwargs = calls[0]
+    assert query is q
+    assert key.shape == value.shape == (2, 4, 4, 8)
+    assert kwargs == {
+        "num_heads": 4,
+        "num_key_value_heads": 4,
+        "input_layout": "BSND",
+        "scale": 1.0 / math.sqrt(8),
+    }
 
-    # The implementation attends over the whole populated cache window, so the
-    # reference must use the same window (zero-padded past positions included).
-    cache_end = cache_position + 1
-    q_t = q.transpose(1, 2)
-    k_t = k_cache[:, :cache_end].transpose(1, 2)
-    v_t = v_cache[:, :cache_end].transpose(1, 2)
-    causal_mask = torch.tril(
-        torch.ones(q_t.shape[2], k_t.shape[2], dtype=torch.bool),
-        diagonal=k_t.shape[2] - q_t.shape[2],
+
+def test_npu_kvcache_attention_requires_fused_infer_attention(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        fish_audio_decoder.torch.ops,
+        "npu",
+        SimpleNamespace(),
+        raising=False,
     )
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q_t, k_t, v_t, attn_mask=causal_mask, is_causal=False
-    ).transpose(1, 2)
-    assert torch.allclose(out, ref, atol=1e-5)
+    q = torch.randn(1, 1, 4, 8)
+    k_cache = torch.zeros(1, 11, 4, 8)
+    v_cache = torch.zeros(1, 11, 4, 8)
+
+    with pytest.raises(RuntimeError, match="npu_fused_infer_attention_score"):
+        fish_audio_decoder._npu_kvcache_attention(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=q,
+            v=q,
+            cache_position=0,
+        )
 
 
-def test_npu_kvcache_attention_attends_to_full_populated_prefix() -> None:
-    bs, seq_q, n_heads, head_dim, cache_len = 1, 1, 4, 8, 11
-    q = torch.randn(bs, seq_q, n_heads, head_dim)
-    k = torch.randn(bs, seq_q, n_heads, head_dim)
-    v = torch.randn(bs, seq_q, n_heads, head_dim)
-    # Pre-populate the prefix: past positions must stay visible to the new
-    # trailing query (torch's is_causal would only expose the first position).
-    k_cache = torch.randn(bs, cache_len, n_heads, head_dim)
-    v_cache = torch.randn(bs, cache_len, n_heads, head_dim)
-    cache_position = 7
-
-    out = fish_audio_decoder._npu_kvcache_attention(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        k=k,
-        v=v,
-        cache_position=cache_position,
+def test_npu_kvcache_attention_requires_single_token_query(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fish_audio_decoder.torch.ops,
+        "npu",
+        SimpleNamespace(npu_fused_infer_attention_score=lambda *args, **kwargs: None),
+        raising=False,
     )
+    q = torch.randn(1, 2, 4, 8)
+    k_cache = torch.zeros(1, 11, 4, 8)
+    v_cache = torch.zeros(1, 11, 4, 8)
 
-    cache_end = cache_position + 1
-    q_t = q.transpose(1, 2)
-    k_t = k_cache[:, :cache_end].transpose(1, 2)
-    v_t = v_cache[:, :cache_end].transpose(1, 2)
-    causal_mask = torch.tril(
-        torch.ones(q_t.shape[2], k_t.shape[2], dtype=torch.bool),
-        diagonal=k_t.shape[2] - q_t.shape[2],
-    )
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q_t, k_t, v_t, attn_mask=causal_mask, is_causal=False
-    ).transpose(1, 2)
+    with pytest.raises(ValueError, match="single-token query"):
+        fish_audio_decoder._npu_kvcache_attention(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=q,
+            v=q,
+            cache_position=0,
+        )
 
-    assert torch.allclose(out, ref, atol=1e-5)
+
+def test_fast_ar_attention_rejects_unsupported_device_clearly() -> None:
+    q = torch.randn(1, 1, 4, 8)
+    k = torch.randn(1, 1, 4, 8)
+    v = torch.randn(1, 1, 4, 8)
+    k_cache = torch.zeros(1, 11, 4, 8)
+    v_cache = torch.zeros(1, 11, 4, 8)
+
+    with pytest.raises(RuntimeError, match="supports CUDA and NPU"):
+        fish_audio_decoder.flash_attn_kvcache_op(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            cache_position=0,
+        )
 
 
 def test_npu_kvcache_attention_requires_kv_and_cache_position() -> None:
@@ -136,6 +175,37 @@ def test_fish_engine_builder_npu_defaults(monkeypatch) -> None:
     assert overrides["cuda_graph_max_bs"] == 16
 
     assert fish_engine._resolve_fast_ar_attention_backend(gpu_id=0) == "ascend"
+
+
+def test_fish_engine_builder_compiles_when_npu_opt_in_is_enabled(monkeypatch) -> None:
+    from sglang_omni.models.fishaudio_s2_pro import engine_builder as fish_engine
+
+    monkeypatch.setattr(
+        fish_engine,
+        "current_platform",
+        SimpleNamespace(is_npu=lambda: True, device_type="npu"),
+    )
+    compiled: list[tuple[object, int]] = []
+    monkeypatch.setattr(
+        fish_engine.fish_stages,
+        "_compile_s2pro_codebook_decoder",
+        lambda model, *, max_batch_size: compiled.append((model, max_batch_size)),
+    )
+
+    def apply_override(server_args, _source, **fields):
+        for key, value in fields.items():
+            setattr(server_args, key, value)
+
+    monkeypatch.setattr(fish_engine, "override_server_args", apply_override)
+
+    builder = fish_engine.FishS2ProEngineBuilder(max_new_tokens=256, ras_window=16)
+    model = object()
+    server_args = SimpleNamespace(enable_torch_compile=True, torch_compile_max_bs=16)
+
+    builder.compile_model(model, server_args)
+
+    assert compiled == [(model, 16)]
+    assert server_args.enable_torch_compile is False
 
 
 def test_fish_engine_builder_cuda_defaults_unchanged(monkeypatch) -> None:
@@ -200,11 +270,11 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
 
 def test_s2pro_tts_engine_stage_device_is_platformized() -> None:
     from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
-    from sglang_omni.platforms import current_platform
+    from sglang_omni.utils.device import resolve_device_spec
 
     config = S2ProPipelineConfig(model_path="x")
     tts_stage = next(
         stage for stage in config.stages if stage.name == "tts_engine"
     )
 
-    assert tts_stage.factory_args["device"] == f"{current_platform.device_type}:0"
+    assert tts_stage.factory_args["device"] == resolve_device_spec(None, 0)
