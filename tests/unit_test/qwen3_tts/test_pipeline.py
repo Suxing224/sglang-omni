@@ -1564,6 +1564,23 @@ def test_qwen3_tts_predictor_graph_is_cuda_only(
     assert sglang_model.Qwen3TTSTalker._resolve_predictor_graph_enabled(talker) is False
 
 
+def test_qwen3_tts_predictor_graph_disabled_without_cuda_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts import sglang_model
+
+    monkeypatch.setattr(
+        sglang_model,
+        "get_global_server_args",
+        lambda: (_ for _ in ()).throw(AssertionError("must not inspect server args")),
+    )
+
+    assert sglang_model.Qwen3TTSTalker._resolve_predictor_graph_enabled(
+        SimpleNamespace()
+    ) is False
+
+
 def test_qwen3_tts_custom_voice_requires_speaker_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

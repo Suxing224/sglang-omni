@@ -1312,7 +1312,13 @@ class Qwen3TTSTalker(nn.Module):
     def _resolve_predictor_graph_enabled(self) -> bool:
         if not _predictor_graph_env_enabled():
             return False
-        if self._predictor_input_buffer.device.type != "cuda":
+        # The input buffer is created only when CUDA Graph capture is
+        # initialized. NPU and other eager paths intentionally do not create
+        # it, and must be rejected before touching the CUDA-only state.
+        predictor_input_buffer = getattr(self, "_predictor_input_buffer", None)
+        if predictor_input_buffer is None:
+            return False
+        if predictor_input_buffer.device.type != "cuda":
             return False
         server_args = get_global_server_args()
         if bool(server_args.disable_cuda_graph):
