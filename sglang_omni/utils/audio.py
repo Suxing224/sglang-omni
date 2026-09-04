@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import io
 import logging
 import math
@@ -43,7 +44,10 @@ def check_torchcodec_ready() -> bool:
     global _TORCHCODEC_USABLE
     if _TORCHCODEC_USABLE is None:
         try:
-            from torchcodec.decoders import AudioDecoder
+            # Probe import via importlib so the module name never binds a name
+            # that an unused-import linter would strip (the probe relies on the
+            # import raising for missing/unloadable torchcodec wheels).
+            importlib.import_module("torchcodec.decoders")
         except (ImportError, OSError, RuntimeError) as exc:
             _TORCHCODEC_USABLE = False
             logger.warning(
@@ -52,7 +56,6 @@ def check_torchcodec_ready() -> bool:
                 exc,
             )
         else:
-            del AudioDecoder
             _TORCHCODEC_USABLE = True
     return _TORCHCODEC_USABLE
 
@@ -71,48 +74,12 @@ def _decode_with_soundfile(
 
     decoder_source = io.BytesIO(source) if isinstance(source, bytes) else source
     try:
-        data, sample_rate = sf.read(
-            decoder_source, dtype="float32", always_2d=True
-        )
+        data, sample_rate = sf.read(decoder_source, dtype="float32", always_2d=True)
     except Exception as exc:
         raise AudioDecodeError(
             "Could not decode audio input with the soundfile backend"
         ) from exc
     return torch.from_numpy(np.ascontiguousarray(data.T)), int(sample_rate)
-
-
-def decode_audio_waveform(
-    source: str | bytes | io.BytesIO,
-) -> tuple[torch.Tensor, int]:
-    """Decode audio into a (waveform [C, T], sample_rate) pair.
-
-    Prefers torchaudio (torchcodec backend) and only falls back to the
-    soundfile decoder when torchcodec cannot be imported/loaded (e.g. CPU-only
-    torch images such as Ascend NPU containers). The CUDA path is unchanged:
-    torchcodec is present there and always used.
-    """
-    decoder_source = io.BytesIO(source) if isinstance(source, bytes) else source
-    if not check_torchcodec_ready():
-        return _decode_with_soundfile(decoder_source)
-    try:
-        # Function-scoped import so torchaudio is resolved from sys.modules at
-        # call time (upstream stages.py did the same, and unit tests rely on
-        # monkeypatching sys.modules["torchaudio"]).
-        import torchaudio as _torchaudio
-
-        return _torchaudio.load(decoder_source)
-    except ImportError:
-        return _decode_with_soundfile(decoder_source)
-    except (MemoryError, torch.OutOfMemoryError):
-        raise
-    except RuntimeError as exc:
-        if _has_operational_decoder_cause(exc):
-            # Operational failures (e.g. decoder OOM) must propagate unchanged;
-            # only decode-level failures are candidates for the fallback.
-            raise
-        if not _is_invalid_audio_source(source):
-            raise
-        raise AudioDecodeError("Could not decode audio input") from exc
 
 
 def _has_operational_decoder_cause(exc: BaseException) -> bool:

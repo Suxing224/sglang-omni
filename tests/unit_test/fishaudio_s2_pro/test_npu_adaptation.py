@@ -234,9 +234,11 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     from sglang_omni.models.fishaudio_s2_pro import streaming_vocoder
 
     # The tts_engine stage resolves device=None via resolve_device_spec.
-    default = inspect.signature(
-        fish_stages.create_sglang_tts_engine_executor
-    ).parameters["device"].default
+    default = (
+        inspect.signature(fish_stages.create_sglang_tts_engine_executor)
+        .parameters["device"]
+        .default
+    )
     assert default is None
 
     # The vocoder stage resolves device=None from gpu_id via resolve_device_spec.
@@ -263,7 +265,9 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     assert seen[-1] == "npu"
 
     monkeypatch.setattr(
-        fish_stages, "resolve_device_spec", lambda device, index: f"cuda:{index}" if index is not None else "cpu"
+        fish_stages,
+        "resolve_device_spec",
+        lambda device, index: f"cuda:{index}" if index is not None else "cpu",
     )
     fish_stages.create_vocoder_executor("model", device=None, gpu_id=0)
     assert seen[-1] == "cuda:0"
@@ -273,9 +277,7 @@ def test_s2pro_tts_engine_stage_uses_placement_gpu_id() -> None:
     from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 
     config = S2ProPipelineConfig(model_path="x")
-    tts_stage = next(
-        stage for stage in config.stages if stage.name == "tts_engine"
-    )
+    tts_stage = next(stage for stage in config.stages if stage.name == "tts_engine")
 
     assert "device" not in tts_stage.factory_args
 
@@ -294,9 +296,7 @@ def test_s2pro_tts_engine_factory_forwards_placement_gpu_id(monkeypatch) -> None
 
     monkeypatch.setattr(fish_engine.FishS2ProEngineBuilder, "build", build)
 
-    fish_stages.create_sglang_tts_engine_executor(
-        "model", device=None, gpu_id=1
-    )
+    fish_stages.create_sglang_tts_engine_executor("model", device=None, gpu_id=1)
 
     assert captured["model_path"] == "model"
     assert captured["device"] is None

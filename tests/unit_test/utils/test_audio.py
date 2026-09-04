@@ -5,8 +5,8 @@ from __future__ import annotations
 import io
 import struct
 import sys
-from types import ModuleType
 import wave
+from types import ModuleType
 
 import numpy as np
 import pybase64
@@ -97,15 +97,6 @@ def test_load_audio_falls_back_when_torchcodec_is_unavailable(monkeypatch) -> No
     samples = load_audio(_wav_bytes(), mono=False)
 
     assert samples.shape == (1, 1600)
-
-
-def test_decode_audio_waveform_falls_back_for_raw_bytes(monkeypatch) -> None:
-    monkeypatch.setattr(audio, "check_torchcodec_ready", lambda: False)
-
-    waveform, sample_rate = audio.decode_audio_waveform(_wav_bytes())
-
-    assert sample_rate == 16000
-    assert waveform.shape == (1, 1600)
 
 
 def test_load_audio_preserves_wrapped_decoder_oom(monkeypatch) -> None:
