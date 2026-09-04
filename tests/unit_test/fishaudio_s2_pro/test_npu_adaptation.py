@@ -274,12 +274,17 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
 
 
 def test_s2pro_tts_engine_stage_uses_placement_gpu_id() -> None:
+    from sglang_omni.config.runtime import resolve_stage_typed_kwargs
     from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 
     config = S2ProPipelineConfig(model_path="x")
     tts_stage = next(stage for stage in config.stages if stage.name == "tts_engine")
 
-    assert "device" not in tts_stage.factory_args
+    # Device resolution is placement's job at runtime: the stage declares
+    # gpu=0 and must not bake a platform-specific device string into its
+    # factory kwargs.
+    assert tts_stage.gpu == 0
+    assert "device" not in resolve_stage_typed_kwargs(tts_stage)
 
 
 def test_s2pro_tts_engine_factory_forwards_placement_gpu_id(monkeypatch) -> None:
