@@ -14,7 +14,6 @@ from typing import Any
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
-from sglang_omni.platforms import current_platform
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
@@ -170,10 +169,17 @@ class _FishReferenceEncodeHook(TensorReferenceEncodeHook[_FishReferenceInput]):
 
     def encode_one(self, item: _FishReferenceInput) -> torch.Tensor:
         if item.source_kind == "path":
-            from sglang_omni.utils.audio import decode_audio_waveform
+            from sglang_omni.utils.audio import load_audio
 
-            audio, sr = decode_audio_waveform(str(item.source))
-            return self._encode_reference_waveform(audio, int(sr))
+            audio = load_audio(
+                str(item.source),
+                target_sample_rate=int(self._codec.sample_rate),
+                mono=True,
+            )
+            audio_tensor = torch.from_numpy(audio).float().reshape(1, -1)
+            return self._encode_reference_waveform(
+                audio_tensor, int(self._codec.sample_rate)
+            )
         if item.source_kind in ("bytes", "base64"):
             from sglang_omni.preprocessing.audio import AudioMediaIO
 
@@ -308,6 +314,7 @@ def create_sglang_tts_engine_executor(
     model_path: str,
     *,
     device: str | None = None,
+    gpu_id: int | None = None,
     max_new_tokens: int = 2048,
     top_k: int = 30,
     ras_window: int = 16,
@@ -315,8 +322,6 @@ def create_sglang_tts_engine_executor(
 ):
     """Returns OmniScheduler for the Fish TTS AR engine."""
     del top_k
-    if device is None:
-        device = resolve_device_spec(None, 0)
     from sglang_omni.models.fishaudio_s2_pro.engine_builder import (
         FishS2ProEngineBuilder,
     )
@@ -327,6 +332,7 @@ def create_sglang_tts_engine_executor(
     ).build(
         model_path,
         device=device,
+        gpu_id=gpu_id,
         server_args_overrides=server_args_overrides,
     )
 

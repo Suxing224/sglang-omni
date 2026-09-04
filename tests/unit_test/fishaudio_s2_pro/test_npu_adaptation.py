@@ -232,7 +232,6 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
 
     from sglang_omni.models.fishaudio_s2_pro import stages as fish_stages
     from sglang_omni.models.fishaudio_s2_pro import streaming_vocoder
-    from sglang_omni.platforms import current_platform
 
     # The tts_engine stage resolves device=None via resolve_device_spec.
     default = inspect.signature(
@@ -243,7 +242,9 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     # The vocoder stage resolves device=None from gpu_id via resolve_device_spec.
     seen: list[str] = []
     monkeypatch.setattr(
-        fish_stages, "resolve_device_spec", lambda device, index: f"npu:{index}" if index is not None else "cpu"
+        fish_stages,
+        "resolve_device_spec",
+        lambda device, index: f"npu:{index}" if index is not None else "npu",
     )
     monkeypatch.setattr(fish_stages, "_resolve_checkpoint", lambda model_path: "ckpt")
     monkeypatch.setattr(
@@ -259,7 +260,7 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     assert seen[-1] == "npu:0"
 
     fish_stages.create_vocoder_executor("model", device=None, gpu_id=None)
-    assert seen[-1] == "cpu"
+    assert seen[-1] == "npu"
 
     monkeypatch.setattr(
         fish_stages, "resolve_device_spec", lambda device, index: f"cuda:{index}" if index is not None else "cpu"
@@ -268,13 +269,35 @@ def test_stage_devices_resolve_from_current_platform(monkeypatch) -> None:
     assert seen[-1] == "cuda:0"
 
 
-def test_s2pro_tts_engine_stage_device_is_platformized() -> None:
+def test_s2pro_tts_engine_stage_uses_placement_gpu_id() -> None:
     from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
-    from sglang_omni.utils.device import resolve_device_spec
 
     config = S2ProPipelineConfig(model_path="x")
     tts_stage = next(
         stage for stage in config.stages if stage.name == "tts_engine"
     )
 
-    assert tts_stage.factory_args["device"] == resolve_device_spec(None, 0)
+    assert "device" not in tts_stage.factory_args
+
+
+def test_s2pro_tts_engine_factory_forwards_placement_gpu_id(monkeypatch) -> None:
+    from sglang_omni.models.fishaudio_s2_pro import engine_builder as fish_engine
+    from sglang_omni.models.fishaudio_s2_pro import stages as fish_stages
+
+    captured: dict[str, object] = {}
+
+    def build(self, model_path, **kwargs):
+        del self
+        captured["model_path"] = model_path
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(fish_engine.FishS2ProEngineBuilder, "build", build)
+
+    fish_stages.create_sglang_tts_engine_executor(
+        "model", device=None, gpu_id=1
+    )
+
+    assert captured["model_path"] == "model"
+    assert captured["device"] is None
+    assert captured["gpu_id"] == 1

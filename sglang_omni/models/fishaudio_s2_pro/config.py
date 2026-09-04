@@ -11,7 +11,6 @@ from sglang_omni.config import (
     PipelineConfig,
     StageConfig,
 )
-from sglang_omni.utils.device import resolve_device_spec
 
 _PKG = "sglang_omni.models.fishaudio_s2_pro"
 
@@ -39,7 +38,6 @@ class S2ProPipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory=FactoryArgs(
-                device=resolve_device_spec(None, 0),
                 max_new_tokens=2048,
             ),
             gpu=0,
