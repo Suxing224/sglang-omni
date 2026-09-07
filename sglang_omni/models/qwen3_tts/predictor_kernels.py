@@ -5,15 +5,26 @@ from __future__ import annotations
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # pragma: no cover - depends on runtime image
+if torch.version.cuda is not None or getattr(torch.version, "hip", None) is not None:
+    try:
+        import triton
+        import triton.language as tl
+    except ImportError:  # pragma: no cover - depends on runtime image
+        triton = None
+        tl = None
+else:
     triton = None
     tl = None
 
 
-if triton is not None:
+def _has_cuda_or_rocm_triton_runtime() -> bool:
+    return triton is not None and (
+        torch.version.cuda is not None
+        or getattr(torch.version, "hip", None) is not None
+    )
+
+
+if _has_cuda_or_rocm_triton_runtime():
 
     @triton.jit
     def _gather_codec_embedding_and_add_kernel(
