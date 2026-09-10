@@ -13,14 +13,13 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
 )
 
 
-def test_predictor_triton_kernel_is_disabled_for_non_cuda_pytorch(
+def test_predictor_triton_kernel_is_disabled_on_npu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(predictor_kernels, "triton", object())
-    monkeypatch.setattr(torch.version, "cuda", None)
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(predictor_kernels, "_is_npu_runtime", lambda: True)
 
-    assert not predictor_kernels._has_cuda_or_rocm_triton_runtime()
+    assert not predictor_kernels._has_triton_runtime()
 
 
 def test_gather_codec_embedding_and_add_cpu_falls_back_without_writes():

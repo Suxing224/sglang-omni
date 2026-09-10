@@ -26,6 +26,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_STREAM_STRIDE,
     Qwen3TTSStreamingVocoderScheduler,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
@@ -55,7 +56,7 @@ def _resolve_qwen3_tts_attn_implementation(
     attn_implementation: str | None,
 ) -> str | None:
     device_type = str(device).strip().partition(":")[0].lower()
-    if device_type != "npu":
+    if not current_platform.is_npu() or device_type != "npu":
         return attn_implementation
     if attn_implementation in _NPU_UNSUPPORTED_ATTN_IMPLEMENTATIONS:
         raise ValueError(

@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import torch
 
-if torch.version.cuda is not None or getattr(torch.version, "hip", None) is not None:
+
+def _is_npu_runtime() -> bool:
+    npu = getattr(torch, "npu", None)
+    return npu is not None and bool(npu.is_available())
+
+
+if not _is_npu_runtime():
     try:
         import triton
         import triton.language as tl
@@ -17,14 +23,11 @@ else:
     tl = None
 
 
-def _has_cuda_or_rocm_triton_runtime() -> bool:
-    return triton is not None and (
-        torch.version.cuda is not None
-        or getattr(torch.version, "hip", None) is not None
-    )
+def _has_triton_runtime() -> bool:
+    return triton is not None and not _is_npu_runtime()
 
 
-if _has_cuda_or_rocm_triton_runtime():
+if _has_triton_runtime():
 
     @triton.jit
     def _gather_codec_embedding_and_add_kernel(
