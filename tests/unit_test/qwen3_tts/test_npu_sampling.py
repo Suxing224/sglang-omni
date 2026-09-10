@@ -181,12 +181,11 @@ def test_npu_sampling_dispatch_does_not_capture_cpu() -> None:
     assert sampled is None
 
 
-def test_cuda_triton_kernel_is_disabled_for_non_cuda_pytorch(monkeypatch) -> None:
+def test_triton_kernel_is_disabled_on_npu(monkeypatch) -> None:
     monkeypatch.setattr(sampling_kernels, "triton", object())
-    monkeypatch.setattr(torch.version, "cuda", None)
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(sampling_kernels, "_is_npu_runtime", lambda: True)
 
-    assert not sampling_kernels._has_cuda_or_rocm_triton_runtime()
+    assert not sampling_kernels._has_triton_runtime()
 
 
 def test_sorted_sampler_uses_float32_path_for_npu(monkeypatch) -> None:

@@ -101,43 +101,12 @@ def _sample_seeded_categorical(
     seeds: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
-    sampled = sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
-    if sampled is not None:
+    if logprobs.device.type == "npu":
+        sampled = sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
+        if sampled is None:  # pragma: no cover - guarded by the device check
+            raise RuntimeError("NPU seeded sampling did not return a result")
         return sampled
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
-
-
-def _predictor_scaled_dot_product_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    *,
-    num_kv_groups: int,
-    expand_gqa: bool,
-) -> torch.Tensor:
-    if num_kv_groups == 1:
-        return torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            is_causal=False,
-        )
-    if expand_gqa:
-        key = key.repeat_interleave(num_kv_groups, dim=1)
-        value = value.repeat_interleave(num_kv_groups, dim=1)
-        return torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            is_causal=False,
-        )
-    return torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        is_causal=False,
-        enable_gqa=True,
-    )
 
 
 class _PredictorDecodeGraph:
@@ -1897,13 +1866,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         cached_v = self._predictor_v_cache[
             layer_idx, :batch_size, : cache_len + 1
         ].transpose(1, 2)
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        attn_output = _predictor_scaled_dot_product_attention(
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             cached_k,
             cached_v,
-            num_kv_groups=num_kv_groups,
-            expand_gqa=q.device.type == "npu",
+            is_causal=False,
+            enable_gqa=True,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim

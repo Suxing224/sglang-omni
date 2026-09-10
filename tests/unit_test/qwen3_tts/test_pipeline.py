@@ -492,20 +492,24 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:
 
 
 @pytest.mark.parametrize(
-    ("device", "requested", "expected"),
+    ("is_npu", "device", "requested", "expected"),
     [
-        ("npu:0", None, "sdpa"),
-        ("npu:0", "sdpa", "sdpa"),
-        ("npu:0", "eager", "eager"),
-        ("cuda:0", None, None),
-        ("cpu", "eager", "eager"),
+        (True, "npu:0", None, "sdpa"),
+        (True, "npu:0", "sdpa", "sdpa"),
+        (True, "npu:0", "eager", "eager"),
+        (True, "cuda:0", None, None),
+        (False, "cpu", None, None),
+        (False, "cpu", "eager", "eager"),
     ],
 )
 def test_qwen3_tts_tokenizer_attention_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    is_npu: bool,
     device: str,
     requested: str | None,
     expected: str | None,
 ) -> None:
+    monkeypatch.setattr(qwen3_stages.current_platform, "is_npu", lambda: is_npu)
     assert (
         qwen3_stages._resolve_qwen3_tts_attn_implementation(device, requested)
         == expected
@@ -517,8 +521,10 @@ def test_qwen3_tts_tokenizer_attention_policy(
     ["flash_attention_2", "flash_attention_3", "flash_attention_4"],
 )
 def test_qwen3_tts_tokenizer_rejects_cuda_flash_attention_on_npu(
+    monkeypatch: pytest.MonkeyPatch,
     implementation: str,
 ) -> None:
+    monkeypatch.setattr(qwen3_stages.current_platform, "is_npu", lambda: True)
     with pytest.raises(ValueError, match="cannot use.*on NPU"):
         qwen3_stages._resolve_qwen3_tts_attn_implementation("npu:0", implementation)
 
@@ -1492,9 +1498,11 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_cuda_results(
             return SimpleNamespace(audio_codes=[code])
 
     monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda device: FakeCurrentStream(),
+        qwen3_request_builders.torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(
+            current_stream=lambda current: FakeCurrentStream()
+        ),
     )
     batcher = qwen3_request_builders._Qwen3TTSRefCodeBatcher(
         FakeSpeechTokenizer(),
@@ -1518,11 +1526,11 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_npu_results(
     device = FakeNpuDevice()
     code = SimpleNamespace(is_cuda=False, device=device)
     synchronized: list[object] = []
+    stream = SimpleNamespace(synchronize=lambda: synchronized.append(device))
     monkeypatch.setattr(
         qwen3_request_builders.torch,
-        "npu",
-        SimpleNamespace(synchronize=synchronized.append),
-        raising=False,
+        "get_device_module",
+        lambda selected: SimpleNamespace(current_stream=lambda current: stream),
     )
     owner = SimpleNamespace(_encode_stream=None)
 
@@ -1533,20 +1541,22 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_npu_results(
     assert synchronized == [device]
 
 
-def test_qwen3_tts_reference_code_batcher_requires_torch_npu(
+def test_qwen3_tts_reference_code_batcher_skips_cpu_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeNpuDevice:
-        type = "npu"
-
-    code = SimpleNamespace(is_cuda=False, device=FakeNpuDevice())
-    monkeypatch.delattr(qwen3_request_builders.torch, "npu", raising=False)
+    code = SimpleNamespace(is_cuda=False, device=SimpleNamespace(type="cpu"))
+    monkeypatch.setattr(
+        qwen3_request_builders.torch,
+        "get_device_module",
+        lambda selected: (_ for _ in ()).throw(
+            AssertionError("CPU results must not request an accelerator module")
+        ),
+    )
     owner = SimpleNamespace(_encode_stream=None)
 
-    with pytest.raises(RuntimeError, match="torch.npu is unavailable"):
-        qwen3_request_builders._Qwen3TTSRefCodeBatcher._synchronize_outcomes(
-            owner, {0: code}
-        )
+    qwen3_request_builders._Qwen3TTSRefCodeBatcher._synchronize_outcomes(
+        owner, {0: code}
+    )
 
 
 def test_qwen3_tts_reference_code_batcher_has_no_stream_for_cpu_device() -> None:
@@ -2020,34 +2030,34 @@ def test_qwen3_tts_predictor_codec_embeddings_use_talker_hidden_size(
     assert predictor.small_to_mtp_projection.weight.shape == (1024, 2048)
 
 
-@pytest.mark.parametrize(("query_len", "kv_len"), [(5, 5), (1, 17)])
-def test_qwen3_tts_predictor_npu_gqa_fallback_matches_expanded_sdpa(
+def test_qwen3_tts_cpu_seeded_sampling_skips_npu_sampler(
     monkeypatch: pytest.MonkeyPatch,
-    query_len: int,
-    kv_len: int,
 ) -> None:
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts import sglang_model
 
-    query = torch.randn(2, 4, query_len, 8)
-    key = torch.randn(2, 2, kv_len, 8)
-    value = torch.randn(2, 2, kv_len, 8)
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key.repeat_interleave(2, dim=1),
-        value.repeat_interleave(2, dim=1),
-        is_causal=False,
+    monkeypatch.setattr(
+        sglang_model,
+        "sample_from_logprobs_with_seed_npu",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("non-NPU tensors must not call the NPU sampler")
+        ),
+    )
+    monkeypatch.setattr(
+        sglang_model,
+        "multinomial_with_seed",
+        lambda logprobs, seeds, positions: torch.ones(
+            (logprobs.shape[0], 1), dtype=torch.long
+        ),
     )
 
-    actual = sglang_model._predictor_scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        num_kv_groups=2,
-        expand_gqa=True,
+    sampled = sglang_model._sample_seeded_categorical(
+        torch.zeros((2, 3)),
+        torch.tensor([1, 2]),
+        torch.tensor([0, 0]),
     )
 
-    assert torch.allclose(actual, expected)
+    assert sampled.tolist() == [1, 1]
 
 
 def test_qwen3_tts_predictor_graph_is_cuda_only(
