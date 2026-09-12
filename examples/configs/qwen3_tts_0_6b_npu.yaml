@@ -27,7 +27,7 @@ stages:
     factory:
       dtype: bfloat16
       attn_implementation: sdpa
-      max_batch_size: 1
+      max_batch_size: 8
       initial_max_batch_size: 1
       followup_max_batch_size: 1
       async_decode: false

@@ -82,8 +82,9 @@ sgl-omni serve \
 ### Ascend NPU baseline
 
 The NPU configurations use SGLang's `ascend` attention backend for the Talker
-and PyTorch SDPA for both Speech Tokenizer instances. CUDA Graph, private
-Talker compile, and asynchronous vocoder decode stay disabled. The 0.6B Base
+and PyTorch SDPA for both Speech Tokenizer instances. Talker graph capture
+(`cuda_graph`), private Talker compile, and asynchronous vocoder decode stay
+disabled. The 0.6B Base
 configuration has been validated with 16 concurrent requests; the other
 configurations retain a conservative single-request baseline.
 
@@ -115,7 +116,8 @@ enable_deterministic_inference: true
 When enabled, the same prompt, reference audio, and seed produce byte-identical
 PCM across runtime batch sizes. This mode reduces throughput because it
 serializes reference preprocessing and vocoder decoding and disables both the
-initial and follow-up vocoder CUDA Graphs, so it is disabled by default.
+initial and follow-up vocoder graph-capture paths (`initial_cuda_graph` and
+`followup_cuda_graph`), so it is disabled by default.
 
 ### Overload / admission policy
 
