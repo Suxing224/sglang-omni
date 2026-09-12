@@ -5,13 +5,9 @@ from __future__ import annotations
 
 import torch
 
+from sglang_omni.platforms import current_platform
 
-def _is_npu_runtime() -> bool:
-    npu = getattr(torch, "npu", None)
-    return npu is not None and bool(npu.is_available())
-
-
-if not _is_npu_runtime():
+if not current_platform.is_npu():
     try:
         import triton
         import triton.language as tl
@@ -28,7 +24,7 @@ else:
 
 
 def _has_triton_runtime() -> bool:
-    return triton is not None and not _is_npu_runtime()
+    return triton is not None and not current_platform.is_npu()
 
 
 if _has_triton_runtime():

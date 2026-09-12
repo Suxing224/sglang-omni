@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from sglang_omni.platforms import current_platform
+
 _MODULE_PATH = (
     Path(__file__).parents[3] / "sglang_omni/models/qwen3_tts/sampling_kernels.py"
 )
@@ -24,11 +26,7 @@ _UINT32_MASK = 0xFFFFFFFF
 
 
 def _npu_available() -> bool:
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        return False
-    return bool(torch.npu.is_available())
+    return current_platform.is_npu()
 
 
 def _rotl32(value: int, shift: int) -> int:
@@ -183,7 +181,7 @@ def test_npu_sampling_dispatch_does_not_capture_cpu() -> None:
 
 def test_triton_kernel_is_disabled_on_npu(monkeypatch) -> None:
     monkeypatch.setattr(sampling_kernels, "triton", object())
-    monkeypatch.setattr(sampling_kernels, "_is_npu_runtime", lambda: True)
+    monkeypatch.setattr(sampling_kernels.current_platform, "is_npu", lambda: True)
 
     assert not sampling_kernels._has_triton_runtime()
 

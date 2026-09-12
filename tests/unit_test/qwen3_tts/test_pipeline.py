@@ -485,10 +485,12 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:
     config = ConfigManager.from_file(str(config_path)).config
     stages = {stage.name: stage for stage in config.stages}
     engine = stages["tts_engine"].engine
+    vocoder = stages["vocoder"].factory
 
     assert engine.disable_cuda_graph is True
     assert engine.max_running_requests == 16
     assert engine.max_queued_requests == 16
+    assert vocoder.max_batch_size == 8
 
 
 @pytest.mark.parametrize(
