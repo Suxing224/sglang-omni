@@ -490,12 +490,22 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:
     config = ConfigManager.from_file(str(config_path)).config
     stages = {stage.name: stage for stage in config.stages}
     engine = stages["tts_engine"].engine
+    preprocessing = stages["preprocessing"].factory
     vocoder = stages["vocoder"].factory
 
+    assert preprocessing.max_concurrency == 1
     assert engine.disable_cuda_graph is True
     assert engine.max_running_requests == 16
     assert engine.max_queued_requests == 16
     assert vocoder.max_batch_size == 8
+    assert vocoder.initial_max_batch_size == 8
+    assert vocoder.followup_max_batch_size == 8
+    assert vocoder.followup_worker_count == 1
+    assert vocoder.async_decode is True
+    assert vocoder.initial_cuda_graph is False
+    assert vocoder.followup_cuda_graph is False
+    assert vocoder.incremental_codec_cuda_graph is False
+    assert vocoder.incremental_codec_compile is False
 
 
 @pytest.mark.parametrize(
@@ -5388,6 +5398,45 @@ def test_qwen3_tts_async_followup_batches_ready_requests() -> None:
         int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs
     ]
     assert batch_sizes == [1, 1, 2]
+
+
+def test_qwen3_tts_async_worker_binds_accelerator_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+    )
+    device = SimpleNamespace(type="npu", index=3)
+    scheduler._device = device
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_tts.streaming_vocoder.current_platform.set_device",
+        lambda device: calls.append(("device", device)),
+    )
+
+    scheduler._activate_decode_worker(None)
+
+    assert calls == [("device", device)]
+
+
+def test_qwen3_tts_async_worker_keeps_cuda_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+    )
+    scheduler._device = SimpleNamespace(type="cuda", index=0)
+    stream = object()
+    calls: list[object] = []
+    monkeypatch.setattr(torch.cuda, "set_stream", calls.append)
+
+    scheduler._activate_decode_worker(stream)
+
+    assert calls == [stream]
 
 
 def test_qwen3_tts_followup_queue_prioritizes_playback_deadline() -> None:
