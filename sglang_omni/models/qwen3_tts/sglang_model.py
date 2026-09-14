@@ -1302,9 +1302,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     def _resolve_predictor_graph_enabled(self) -> bool:
         if not _predictor_graph_env_enabled():
             return False
-        codec_embedding = getattr(getattr(self, "model", None), "codec_embedding", None)
-        weight = getattr(codec_embedding, "weight", None)
-        if weight is not None and weight.device.type != "cuda":
+        if self.device.type != "cuda":
             return False
         if bool(get_exec().graph.disable_cuda_graph):
             return False

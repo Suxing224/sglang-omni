@@ -1214,6 +1214,11 @@ def test_capture_state_body_failure_restores_state():
 
 def test_resolve_predictor_graph_enabled(monkeypatch: pytest.MonkeyPatch):
     talker = object.__new__(Qwen3TTSTalker)
+    talker.model = SimpleNamespace(
+        codec_embedding=SimpleNamespace(
+            weight=SimpleNamespace(device=torch.device("cuda"))
+        )
+    )
     graph = SimpleNamespace(disable_cuda_graph=False)
     parallel = SimpleNamespace(tp_size=1)
     monkeypatch.setattr(

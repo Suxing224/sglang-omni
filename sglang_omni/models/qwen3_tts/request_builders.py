@@ -841,9 +841,7 @@ class _Qwen3TTSRefCodeBatcher:
         accelerator_devices = {
             outcome.device
             for outcome in outcomes.values()
-            if not isinstance(outcome, Exception)
-            and getattr(outcome, "device", None) is not None
-            and getattr(getattr(outcome, "device", None), "type", None) != "cpu"
+            if not isinstance(outcome, Exception) and outcome.device.type != "cpu"
         }
         for device in accelerator_devices:
             torch.get_device_module(device).current_stream(device).synchronize()
