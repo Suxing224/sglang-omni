@@ -30,6 +30,3 @@ stages:
       max_batch_size: 8
       initial_max_batch_size: 1
       followup_max_batch_size: 1
-      async_decode: false
-      initial_cuda_graph: false
-      followup_cuda_graph: false

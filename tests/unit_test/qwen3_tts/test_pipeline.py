@@ -483,9 +483,6 @@ def test_qwen3_tts_npu_configs_use_eager_sdpa_baseline(
     assert stages["tts_engine"].engine.max_queued_requests == 8
     assert stages["tts_engine"].engine.mem_fraction_static == mem_fraction_static
     assert stages["vocoder"].factory.attn_implementation == "sdpa"
-    assert stages["vocoder"].factory.async_decode is False
-    assert stages["vocoder"].factory.initial_cuda_graph is False
-    assert stages["vocoder"].factory.followup_cuda_graph is False
 
 
 def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:

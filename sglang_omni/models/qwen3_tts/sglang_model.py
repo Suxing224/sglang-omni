@@ -139,10 +139,7 @@ def _sample_seeded_categorical(
     positions: torch.Tensor,
 ) -> torch.Tensor:
     if logprobs.device.type == "npu":
-        sampled = sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
-        if sampled is None:  # pragma: no cover - guarded by the device check
-            raise RuntimeError("NPU seeded sampling did not return a result")
-        return sampled
+        return sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
