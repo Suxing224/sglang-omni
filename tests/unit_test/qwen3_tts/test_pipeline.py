@@ -2184,7 +2184,6 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
         enable_stateful_codec_decoder=False,
-        async_decode=True,
     )
     assert warmed_schedulers == [scheduler]
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
@@ -2209,7 +2208,6 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
 
     assert scheduler.max_batch_size == 2
     assert scheduler.max_batch_wait_s == pytest.approx(0.003)
-    assert scheduler._async_decode is True
     assert decode_batch_sizes == [2]
     assert results[0].data["sample_rate"] == 24000
     first_audio = np.frombuffer(results[0].data["audio_waveform"], dtype=np.float32)
