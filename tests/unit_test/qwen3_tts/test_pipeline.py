@@ -485,7 +485,7 @@ def test_qwen3_tts_npu_configs_use_eager_sdpa_baseline(
     assert stages["vocoder"].factory.attn_implementation == "sdpa"
 
 
-def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:
+def test_qwen3_tts_0_6b_base_npu_config_enables_decode_graph() -> None:
     config_path = Path(__file__).parents[3] / "examples/configs/qwen3_tts_0_6b_npu.yaml"
     config = ConfigManager.from_file(str(config_path)).config
     stages = {stage.name: stage for stage in config.stages}
@@ -494,7 +494,7 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_eager_concurrency() -> None:
     vocoder = stages["vocoder"].factory
 
     assert preprocessing.max_concurrency == 1
-    assert engine.disable_cuda_graph is True
+    assert engine.disable_cuda_graph is False
     assert engine.max_running_requests == 16
     assert engine.max_queued_requests == 16
     assert vocoder.max_batch_size == 8
