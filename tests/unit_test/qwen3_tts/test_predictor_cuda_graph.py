@@ -93,6 +93,13 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     predictor_len = NUM_CODE_GROUPS + 1
     talker = object.__new__(Qwen3TTSTalker)
     talker.training = False
+    # The lightweight fixture bypasses Talker.__init__, but the graph gate reads
+    # the production device property through model.codec_embedding.
+    talker.model = SimpleNamespace(
+        codec_embedding=SimpleNamespace(
+            weight=SimpleNamespace(device=device),
+        )
+    )
     talker.config = SimpleNamespace(
         num_code_groups=NUM_CODE_GROUPS,
         code_predictor_config=SimpleNamespace(
