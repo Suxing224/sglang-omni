@@ -493,7 +493,8 @@ def _murmur_hash32_pytorch(
         # Ascend can fault in the int64 rotate expression under sustained
         # concurrent sampling. The hash inputs are tiny; compute only this
         # integer-only portion on CPU and return the exact uint32 values.
-        return _murmur_hash32_pytorch(seeds.cpu(), positions.cpu(), num_cols).to(
+        hash_inputs = torch.stack((seeds, positions)).cpu()
+        return _murmur_hash32_pytorch(hash_inputs[0], hash_inputs[1], num_cols).to(
             seeds.device
         )
 
@@ -525,6 +526,21 @@ def _seeded_gumbel_argmax_float32(
     if num_cols == 0:
         raise ValueError("logprobs must contain at least one column")
 
+    gumbel = seeded_gumbel_noise_float32(seeds, positions, num_cols)
+    return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
+
+
+def seeded_gumbel_noise_float32(
+    seeds: torch.Tensor,
+    positions: torch.Tensor,
+    num_cols: int,
+) -> torch.Tensor:
+    """Build deterministic Gumbel noise without float64 device operations."""
+    if seeds.ndim != 1 or positions.shape != seeds.shape:
+        raise ValueError("seeds and positions must be one-dimensional and aligned")
+    if num_cols <= 0:
+        raise ValueError("num_cols must be positive")
+
     hashes = _murmur_hash32_pytorch(seeds, positions, num_cols)
     uniform = hashes.to(dtype=torch.float32) / float(_UINT32_MASK)
     # 0 and UINT32_MAX are valid hashes. Keep both away from log boundaries;
@@ -533,8 +549,7 @@ def _seeded_gumbel_argmax_float32(
         min=torch.finfo(torch.float32).tiny,
         max=1.0 - 2.0**-24,
     )
-    gumbel = -torch.log(-torch.log(uniform))
-    return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
+    return -torch.log(-torch.log(uniform))
 
 
 def sample_from_logprobs_with_seed_npu(

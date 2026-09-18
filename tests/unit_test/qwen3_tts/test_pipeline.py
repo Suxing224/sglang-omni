@@ -6835,6 +6835,71 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
     assert sampler_calls[1]["positions"].tolist() == [11, 11]
 
 
+def test_qwen3_tts_precomputes_all_subtalker_gumbels_in_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts import sglang_model
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.config = SimpleNamespace(num_code_groups=4)
+    talker._sub_seed_offsets = torch.arange(1, 4, dtype=torch.long)
+    talker._sub_sampling_seed_tensor = torch.tensor([17, 23], dtype=torch.long)
+    calls = []
+
+    def record_gumbel(seeds, positions, num_cols):
+        calls.append((seeds.clone(), positions.clone(), num_cols))
+        return torch.zeros((seeds.shape[0], num_cols), dtype=torch.float32)
+
+    monkeypatch.setattr(sglang_model, "seeded_gumbel_noise_float32", record_gumbel)
+    gumbels = Qwen3TTSTalker._precompute_npu_subtalker_gumbels(
+        talker,
+        torch.tensor([[3], [5]], dtype=torch.long),
+        sampling_width=8,
+    )
+
+    assert gumbels.shape == (1, 3, 2, 8)
+    assert len(calls) == 1
+    seeds, positions, num_cols = calls[0]
+    assert seeds.tolist() == [17, 23, 17, 23, 17, 23]
+    assert positions.tolist() == [10, 16, 11, 17, 12, 18]
+    assert num_cols == 8
+
+
+def test_qwen3_tts_subtalker_sampling_uses_precomputed_gumbel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts import sglang_model
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker._sub_temperature_tensor = torch.tensor([1.0])
+    talker._sub_top_p_tensor = torch.tensor([1.0])
+    talker._sub_top_k_tensor = torch.tensor([-1])
+    talker._sub_sampling_seed_tensor = torch.tensor([17])
+    talker._sub_sampled_has_top_p = False
+    talker._sub_sampled_max_top_k = 0
+    talker._sub_sampled_has_unbounded_top_k = True
+
+    def fail_sampler(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("precomputed Gumbel noise must bypass the seeded sampler")
+
+    monkeypatch.setattr(
+        sglang_model, "sample_from_sorted_logprobs_with_seed_small_k", fail_sampler
+    )
+    token = Qwen3TTSTalker._sample_subtalker_token_seeded(
+        talker,
+        torch.tensor([[2.0, 1.0, 0.0]]),
+        sub_positions=torch.tensor([10]),
+        precomputed_gumbel=torch.tensor([[0.0, 10.0, 0.0]]),
+    )
+
+    assert token.tolist() == [1]
+
+
 def test_qwen3_tts_subtalker_top_p_keeps_threshold_crossing_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
