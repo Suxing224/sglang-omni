@@ -501,10 +501,6 @@ def test_qwen3_tts_0_6b_base_npu_config_enables_decode_graph() -> None:
     assert vocoder.followup_max_batch_size == 8
     assert vocoder.followup_worker_count == 1
     assert vocoder.async_decode is True
-    assert vocoder.initial_cuda_graph is False
-    assert vocoder.followup_cuda_graph is False
-    assert vocoder.incremental_codec_cuda_graph is False
-    assert vocoder.incremental_codec_compile is False
 
 
 @pytest.mark.parametrize(
@@ -5404,6 +5400,29 @@ def test_qwen3_tts_async_worker_keeps_cuda_stream(
     assert calls == [stream]
 
 
+@pytest.mark.parametrize("worker", ["initial", "followup"])
+def test_qwen3_tts_async_worker_entry_activates_device(
+    monkeypatch: pytest.MonkeyPatch,
+    worker: str,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(scheduler, "activate_decode_worker", calls.append)
+
+    if worker == "initial":
+        scheduler._initial_queue.put(None)
+        scheduler.run_initial_worker()
+    else:
+        scheduler._followup_queue.put((float("inf"), 0, "", None))
+        scheduler.run_followup_worker()
+
+    assert calls == [None]
+
+
 def test_qwen3_tts_followup_queue_prioritizes_playback_deadline() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
@@ -6852,6 +6871,21 @@ def test_qwen3_tts_precomputes_all_subtalker_gumbels_in_one_call(
     assert seeds.tolist() == [17, 23, 17, 23, 17, 23]
     assert positions.tolist() == [10, 16, 11, 17, 12, 18]
     assert num_cols == 8
+
+
+def test_qwen3_tts_gumbel_precompute_rejects_multiple_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    with pytest.raises(ValueError, match="exactly one decode position"):
+        Qwen3TTSTalker.precompute_npu_subtalker_gumbels(
+            talker,
+            torch.tensor([[3, 4], [5, 6]], dtype=torch.long),
+            sampling_width=8,
+        )
 
 
 def test_qwen3_tts_subtalker_sampling_uses_precomputed_gumbel(

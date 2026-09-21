@@ -1534,15 +1534,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             seq_len=seq_len,
             device=layer0_codes.device,
         )
-        sampling_gumbels = None
-        if self._sub_has_sampled_rows and layer0_codes.device.type == "npu":
-            sampling_gumbels = self.precompute_npu_subtalker_gumbels(
-                semantic_positions,
-                sampling_width=(
-                    int(self._sub_sampled_max_top_k)
-                    or int(self.config.code_predictor_config.vocab_size)
-                ),
-            )
         predictor_dtype = self._predictor_k_cache.dtype
         num_groups = self.config.num_code_groups
         result_codes = self._output_codes[:batch_size].unsqueeze(-1)
@@ -1593,6 +1584,17 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 if self._sub_has_sampled_rows
                 else None
             )
+            sampling_gumbels = None
+            if self._sub_has_sampled_rows and layer0_codes.device.type == "npu":
+                # Decode normally has one position. Keep the fallback bounded
+                # if a future caller supplies a longer sequence.
+                sampling_gumbels = self.precompute_npu_subtalker_gumbels(
+                    semantic_positions[:, pos : pos + 1],
+                    sampling_width=(
+                        int(self._sub_sampled_max_top_k)
+                        or int(self.config.code_predictor_config.vocab_size)
+                    ),
+                )
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
                 next_code = self.sample_subtalker_token(
@@ -1603,7 +1605,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     precomputed_gumbel=(
                         None
                         if sampling_gumbels is None
-                        else sampling_gumbels[pos, layer_idx]
+                        else sampling_gumbels[0, layer_idx]
                     ),
                 )
                 pos_codes[:, layer_idx + 1].copy_(next_code)
@@ -1673,8 +1675,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         sampling_width: int,
     ) -> torch.Tensor:
         """Build all Predictor sampling noise in one NPU hash transfer."""
-        if semantic_positions.ndim != 2:
-            raise ValueError("semantic positions must have shape [batch, sequence]")
+        if semantic_positions.ndim != 2 or semantic_positions.shape[1] != 1:
+            raise ValueError(
+                "semantic positions must contain exactly one decode position"
+            )
         batch_size, seq_len = semantic_positions.shape
         num_substeps = int(self.config.num_code_groups) - 1
         positions = torch.add(

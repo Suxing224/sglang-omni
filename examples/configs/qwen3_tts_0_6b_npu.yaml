@@ -32,7 +32,3 @@ stages:
       followup_max_batch_size: 8
       followup_worker_count: 1
       async_decode: true
-      initial_cuda_graph: false
-      followup_cuda_graph: false
-      incremental_codec_cuda_graph: false
-      incremental_codec_compile: false
