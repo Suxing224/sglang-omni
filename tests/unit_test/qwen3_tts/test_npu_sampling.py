@@ -100,7 +100,7 @@ def test_precomputed_gumbel_noise_matches_seeded_sampler() -> None:
     seeds = torch.tensor([11, 22], dtype=torch.int64)
     positions = torch.tensor([4, 8], dtype=torch.int64)
 
-    expected = sampling_kernels._seeded_gumbel_argmax_float32(
+    expected = sampling_kernels.seeded_gumbel_argmax_float32(
         logprobs, seeds, positions
     )
     gumbel = sampling_kernels.seeded_gumbel_noise_float32(seeds, positions, 3)
