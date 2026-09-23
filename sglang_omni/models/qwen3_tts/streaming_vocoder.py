@@ -505,7 +505,7 @@ class Qwen3TTSInitialDecodeGraphs:
 class Qwen3TTSStreamingVocoderScheduler(
     StreamingVocoderBase[Qwen3TTSStreamState, None]
 ):
-    """Decode Qwen3-TTS codec frames on a priority CUDA stream."""
+    """Decode Qwen3-TTS codec frames on background accelerator workers."""
 
     def __init__(
         self,
@@ -2326,10 +2326,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         # note (luojiaxuan): a decode worker lives on its own stream: planning,
         # slot zeroing and launches all land there, and nothing it does queues
         # behind the talker's work on the default stream.
-        if self._decode_stream is not None:
-            torch.cuda.set_stream(self._decode_stream)
-        else:
-            self.activate_decode_worker(None)
+        self.activate_decode_worker(self._decode_stream)
         while True:
             batch = self.collect_async_batch(
                 self._initial_queue,

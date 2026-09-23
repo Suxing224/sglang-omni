@@ -100,9 +100,7 @@ def test_precomputed_gumbel_noise_matches_seeded_sampler() -> None:
     seeds = torch.tensor([11, 22], dtype=torch.int64)
     positions = torch.tensor([4, 8], dtype=torch.int64)
 
-    expected = sampling_kernels.seeded_gumbel_argmax_float32(
-        logprobs, seeds, positions
-    )
+    expected = sampling_kernels.seeded_gumbel_argmax_float32(logprobs, seeds, positions)
     gumbel = sampling_kernels.seeded_gumbel_noise_float32(seeds, positions, 3)
     actual = torch.argmax(logprobs + gumbel, dim=1)
 
@@ -174,7 +172,7 @@ def test_float32_seeded_sampling_caps_maximum_hash_uniform() -> None:
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
-def test_npu_murmur_hash_and_float32_gumbel_execute_on_device() -> None:
+def test_npu_murmur_hash_and_float32_gumbel_return_on_device() -> None:
     device = torch.device("npu:0")
     seeds = torch.tensor([0, 17, -1], device=device, dtype=torch.int64)
     positions = torch.tensor([1_707_985_137, 3, 9], device=device, dtype=torch.int64)

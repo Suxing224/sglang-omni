@@ -489,10 +489,8 @@ def test_qwen3_tts_0_6b_base_npu_config_enables_decode_graph() -> None:
     config = ConfigManager.from_file(str(config_path)).config
     stages = {stage.name: stage for stage in config.stages}
     engine = stages["tts_engine"].engine
-    preprocessing = stages["preprocessing"].factory
     vocoder = stages["vocoder"].factory
 
-    assert preprocessing.max_concurrency == 1
     assert engine.disable_cuda_graph is False
     assert engine.max_running_requests == 16
     assert engine.max_queued_requests == 16

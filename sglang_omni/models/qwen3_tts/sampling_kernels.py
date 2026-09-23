@@ -515,9 +515,9 @@ def murmur_hash32_pytorch(
         # concurrent sampling. The hash inputs are tiny; compute only this
         # integer-only portion on CPU and return the exact uint32 values.
         hash_inputs = torch.stack((seeds, positions)).cpu()
-        return murmur_hash32_pytorch_impl(
-            hash_inputs[0], hash_inputs[1], num_cols
-        ).to(seeds.device)
+        return murmur_hash32_pytorch_impl(hash_inputs[0], hash_inputs[1], num_cols).to(
+            seeds.device
+        )
     return murmur_hash32_pytorch_impl(seeds, positions, num_cols)
 
 
