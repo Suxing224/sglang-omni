@@ -539,6 +539,13 @@ def seeded_gumbel_argmax_float32(
         raise ValueError("seeds and positions must contain one value per row")
     if num_cols == 0:
         raise ValueError("logprobs must contain at least one column")
+    else:
+        pass
+
+    if logprobs.device.type == "npu":
+        return seeded_gumbel_argmax_npu(logprobs, seeds, positions)
+    else:
+        pass
 
     gumbel = seeded_gumbel_noise_float32(seeds, positions, num_cols)
     return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
@@ -554,11 +561,6 @@ def seeded_gumbel_noise_float32(
         raise ValueError("seeds and positions must be one-dimensional and aligned")
     if num_cols <= 0:
         raise ValueError("num_cols must be positive")
-
-    if logprobs.device.type == "npu":
-        return seeded_gumbel_argmax_npu(logprobs, seeds, positions)
-    else:
-        pass
 
     hashes = murmur_hash32_pytorch(seeds, positions, num_cols)
     uniform = hashes.to(dtype=torch.float32) / float(_UINT32_MASK)
