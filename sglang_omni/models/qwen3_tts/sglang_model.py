@@ -1772,7 +1772,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         scores = logits.float() / temperatures.unsqueeze(1)
         if max_top_k > 0 and max_top_k < vocab_size and not has_unbounded_top_k:
             sorted_scores, sorted_idx = torch.topk(scores, max_top_k, dim=-1)
-            if logits.device.type == "npu" and not self.sub_sampled_has_top_p:
+            if logits.device.type == "npu" and not self._sub_sampled_has_top_p:
                 return sample_top_k_npu(
                     sorted_scores, sorted_idx, top_ks, seeds, sub_positions
                 )
