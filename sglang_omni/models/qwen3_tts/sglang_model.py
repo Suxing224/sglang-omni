@@ -1558,8 +1558,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         num_groups = self.config.num_code_groups
         result_codes = self._output_codes[:batch_size].unsqueeze(-1)
         summed_embeddings = self._output_embeds[:batch_size].unsqueeze(1)
-        result_codes.zero_()
-        summed_embeddings.zero_()
         embedding_buffer = getattr(self, "_predictor_embedding_buffer", None)
         if embedding_buffer is not None:
             embedding_buffer = embedding_buffer[:batch_size]
@@ -1644,8 +1642,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                         dtype=predictor_dtype
                     )
                     pos_summed.add_(new_embed[:, 0, :])
-                new_predictor_embed = self.code_predictor.project_input(new_embed)
                 if layer_idx < num_groups - 2:
+                    new_predictor_embed = self.code_predictor.project_input(new_embed)
                     last_hidden = self.predictor_forward_tokens(
                         token_embeds=new_predictor_embed,
                         batch_size=batch_size,
@@ -1690,12 +1688,20 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         semantic_positions: torch.Tensor,
         *,
         sampling_width: int,
-    ) -> torch.Tensor:
-        """Build all Predictor sampling noise in one NPU hash transfer."""
+    ) -> torch.Tensor | None:
+        """Precompute noise only when the sampler does not generate it in-kernel."""
         if semantic_positions.ndim != 2 or semantic_positions.shape[1] != 1:
             raise ValueError(
                 "semantic positions must contain exactly one decode position"
             )
+        if (
+            not self._sub_sampled_has_top_p
+            and not self._sub_sampled_has_unbounded_top_k
+            and 0
+            < self._sub_sampled_max_top_k
+            < self.config.code_predictor_config.vocab_size
+        ):
+            return None
         batch_size, seq_len = semantic_positions.shape
         num_substeps = int(self.config.num_code_groups) - 1
         positions = torch.add(

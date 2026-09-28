@@ -6839,15 +6839,27 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
     assert sampler_calls[1]["positions"].tolist() == [11, 11]
 
 
+@pytest.mark.parametrize(
+    "max_top_k,has_top_p,has_unbounded_top_k",
+    [(8, True, False), (0, False, True), (8, False, True), (32, False, False)],
+)
 def test_qwen3_tts_precomputes_all_subtalker_gumbels_in_one_call(
     monkeypatch: pytest.MonkeyPatch,
+    max_top_k: int,
+    has_top_p: bool,
+    has_unbounded_top_k: bool,
 ) -> None:
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts import sglang_model
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
     talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
-    talker.config = SimpleNamespace(num_code_groups=4)
+    talker.config = SimpleNamespace(
+        num_code_groups=4, code_predictor_config=SimpleNamespace(vocab_size=32)
+    )
+    talker._sub_sampled_max_top_k = max_top_k
+    talker._sub_sampled_has_top_p = has_top_p
+    talker._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
     talker._sub_seed_offsets = torch.arange(1, 4, dtype=torch.long)
     talker._sub_sampling_seed_tensor = torch.tensor([17, 23], dtype=torch.long)
     calls = []
@@ -6869,6 +6881,98 @@ def test_qwen3_tts_precomputes_all_subtalker_gumbels_in_one_call(
     assert seeds.tolist() == [17, 23, 17, 23, 17, 23]
     assert positions.tolist() == [10, 16, 11, 17, 12, 18]
     assert num_cols == 8
+
+
+def test_qwen3_tts_fused_top_k_skips_gumbel_precompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.config = SimpleNamespace(
+        code_predictor_config=SimpleNamespace(vocab_size=2048)
+    )
+    talker._sub_sampled_max_top_k = 50
+    talker._sub_sampled_has_top_p = False
+    talker._sub_sampled_has_unbounded_top_k = False
+
+    assert (
+        talker.precompute_npu_subtalker_gumbels(
+            torch.tensor([[3], [5]], dtype=torch.long), sampling_width=50
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen3_tts_predictor_overwrites_reused_outputs(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.config = SimpleNamespace(num_code_groups=4)
+    talker._predictor_k_cache = torch.empty(0, dtype=dtype)
+    talker._output_codes = torch.full((5, 4), -1, dtype=torch.long)
+    talker._output_embeds = torch.full((5, 8), float("nan"), dtype=dtype)
+    talker._sub_has_sampled_rows = False
+    talker._sub_batch_size = 5
+    embeddings = [
+        torch.nn.Embedding.from_pretrained(
+            (torch.arange(64).reshape(8, 8) / 16 + group).to(dtype)
+        )
+        for group in range(4)
+    ]
+    projection_inputs = []
+
+    def project_input(hidden_states):
+        projection_inputs.append(hidden_states.clone())
+        return hidden_states * 2
+
+    def predictor_forward_tokens(*, token_embeds, batch_size, cache_len):
+        assert token_embeds.shape[0] == batch_size
+        assert cache_len in (0, 2, 3)
+        return token_embeds.clone()
+
+    class FixedHead:
+        def __init__(self, token: int) -> None:
+            self.token = token
+
+        def __call__(self, hidden_states):
+            logits = torch.zeros((*hidden_states.shape[:2], 8), dtype=dtype)
+            logits[..., self.token] = 1
+            return logits, None
+
+    talker.get_input_embeddings = lambda: embeddings[0]
+    talker.predictor_forward_tokens = predictor_forward_tokens
+    talker.code_predictor = SimpleNamespace(
+        model=SimpleNamespace(codec_embedding=embeddings[1:]),
+        lm_head=[FixedHead(token) for token in (1, 2, 3)],
+        project_input=project_input,
+    )
+    for step, batch_size in enumerate((3, 1, 4)):
+        layer0 = (torch.arange(batch_size) + step).remainder(8).unsqueeze(1)
+        expected_codes = torch.cat(
+            (layer0, torch.tensor([[1, 2, 3]]).expand(batch_size, -1)), dim=1
+        )
+        expected_embeds = embeddings[0](layer0[:, 0]).clone()
+        for group in range(1, 4):
+            expected_embeds.add_(embeddings[group](expected_codes[:, group]))
+        inactive_codes = talker._output_codes[batch_size:].clone()
+        inactive_embeds = talker._output_embeds[batch_size:].clone()
+        projection_inputs.clear()
+        actual_codes, actual_embeds = talker.code_predictor_forward_incremental(
+            layer0, torch.zeros((batch_size, 1, 8), dtype=dtype)
+        )
+        torch.testing.assert_close(actual_codes[..., 0], expected_codes, rtol=0, atol=0)
+        torch.testing.assert_close(actual_embeds[:, 0], expected_embeds, rtol=0, atol=0)
+        torch.testing.assert_close(talker._output_codes[batch_size:], inactive_codes)
+        torch.testing.assert_close(
+            talker._output_embeds[batch_size:], inactive_embeds, equal_nan=True
+        )
+        assert len(projection_inputs) == 3
 
 
 def test_qwen3_tts_gumbel_precompute_rejects_multiple_positions(
