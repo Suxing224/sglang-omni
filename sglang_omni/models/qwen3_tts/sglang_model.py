@@ -1749,7 +1749,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 sampling_gumbels = self.precompute_npu_subtalker_gumbels(
                     semantic_positions[:, pos : pos + 1],
                     sampling_width=(
-                        int(self._sub_sampled_max_top_k)
+                        int(self.sub_sampled_max_top_k)
                         or int(self.config.code_predictor_config.vocab_size)
                     ),
                 )
@@ -1846,21 +1846,21 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 "semantic positions must contain exactly one decode position"
             )
         if (
-            not self._sub_sampled_has_top_p
-            and not self._sub_sampled_has_unbounded_top_k
+            not self.sub_sampled_has_top_p
+            and not self.sub_sampled_has_unbounded_top_k
             and 0
-            < self._sub_sampled_max_top_k
+            < self.sub_sampled_max_top_k
             < self.config.code_predictor_config.vocab_size
         ):
             return None
         batch_size, seq_len = semantic_positions.shape
         num_substeps = int(self.config.num_code_groups) - 1
         positions = torch.add(
-            self._sub_seed_offsets.view(1, num_substeps, 1),
+            self.sub_seed_offsets.view(1, num_substeps, 1),
             semantic_positions.transpose(0, 1).unsqueeze(1),
             alpha=num_substeps,
         )
-        seeds = self._sub_sampling_seed_tensor[:batch_size].view(1, 1, batch_size)
+        seeds = self.sub_sampling_seed_tensor[:batch_size].view(1, 1, batch_size)
         seeds = seeds.expand(seq_len, num_substeps, batch_size)
         return seeded_gumbel_noise_float32(
             seeds.reshape(-1), positions.reshape(-1), sampling_width
@@ -1941,7 +1941,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         scores = logits.float() / temperatures.unsqueeze(1)
         if max_top_k > 0 and max_top_k < vocab_size and not has_unbounded_top_k:
             sorted_scores, sorted_idx = torch.topk(scores, max_top_k, dim=-1)
-            if logits.device.type == "npu" and not self._sub_sampled_has_top_p:
+            if logits.device.type == "npu" and not self.sub_sampled_has_top_p:
                 return sample_top_k_npu(
                     sorted_scores, sorted_idx, top_ks, seeds, sub_positions
                 )

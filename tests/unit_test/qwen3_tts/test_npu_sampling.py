@@ -246,7 +246,7 @@ def test_sorted_seeded_sampler_executes_float32_path_on_npu(
     assert sampled.cpu().tolist() == expected
 
 
-@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("num_cols", [1, 50, 257, 2048])
 def test_npu_fused_gumbel_matches_reference(num_cols: int) -> None:
     generator = torch.Generator().manual_seed(1234)
@@ -264,7 +264,7 @@ def test_npu_fused_gumbel_matches_reference(num_cols: int) -> None:
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 def test_npu_fused_gumbel_graph_replay_uses_updated_inputs() -> None:
     generator = torch.Generator().manual_seed(5678)
     logprobs_cpu = torch.randn(16, 50, generator=generator)
@@ -293,7 +293,7 @@ def test_npu_fused_gumbel_graph_replay_uses_updated_inputs() -> None:
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("width", [1, 8, 50, 128, 1024])
 def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
     from sglang_omni.models.qwen3_tts.npu_sampling import sample_top_k_npu
@@ -321,7 +321,7 @@ def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not _npu_available(), reason="requires Ascend NPU")
+@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 def test_npu_top_k_graph_replay_reads_updated_limits() -> None:
     from sglang_omni.models.qwen3_tts.npu_sampling import sample_top_k_npu
 

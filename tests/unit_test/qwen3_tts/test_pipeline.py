@@ -555,7 +555,7 @@ def test_qwen3_tts_npu_configs_use_eager_sdpa_baseline(
     assert stages["vocoder"].factory.attn_implementation == "sdpa"
 
 
-def test_qwen3_tts_0_6b_base_npu_config_uses_eager_decode() -> None:
+def test_qwen3_tts_0_6b_base_npu_config_uses_conservative_vocoder_defaults() -> None:
     config_path = Path(__file__).parents[3] / "examples/configs/qwen3_tts_0_6b_npu.yaml"
     config = ConfigManager.from_file(str(config_path)).config
     stages = {stage.name: stage for stage in config.stages}
@@ -566,10 +566,9 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_eager_decode() -> None:
     assert engine.max_running_requests == 16
     assert engine.max_queued_requests == 16
     assert vocoder.max_batch_size == 8
-    assert vocoder.initial_max_batch_size == 8
-    assert vocoder.followup_max_batch_size == 8
-    assert vocoder.followup_worker_count == 1
-    assert vocoder.async_decode is True
+    assert vocoder.initial_max_batch_size == 1
+    assert vocoder.followup_max_batch_size == 1
+    assert vocoder.async_decode is None
 
 
 @pytest.mark.parametrize(
@@ -6938,11 +6937,11 @@ def test_qwen3_tts_precomputes_all_subtalker_gumbels_in_one_call(
     talker.config = SimpleNamespace(
         num_code_groups=4, code_predictor_config=SimpleNamespace(vocab_size=32)
     )
-    talker._sub_sampled_max_top_k = max_top_k
-    talker._sub_sampled_has_top_p = has_top_p
-    talker._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
-    talker._sub_seed_offsets = torch.arange(1, 4, dtype=torch.long)
-    talker._sub_sampling_seed_tensor = torch.tensor([17, 23], dtype=torch.long)
+    talker.sub_sampled_max_top_k = max_top_k
+    talker.sub_sampled_has_top_p = has_top_p
+    talker.sub_sampled_has_unbounded_top_k = has_unbounded_top_k
+    talker.sub_seed_offsets = torch.arange(1, 4, dtype=torch.long)
+    talker.sub_sampling_seed_tensor = torch.tensor([17, 23], dtype=torch.long)
     calls = []
 
     def record_gumbel(seeds, positions, num_cols):
@@ -6974,9 +6973,9 @@ def test_qwen3_tts_fused_top_k_skips_gumbel_precompute(
     talker.config = SimpleNamespace(
         code_predictor_config=SimpleNamespace(vocab_size=2048)
     )
-    talker._sub_sampled_max_top_k = 50
-    talker._sub_sampled_has_top_p = False
-    talker._sub_sampled_has_unbounded_top_k = False
+    talker.sub_sampled_max_top_k = 50
+    talker.sub_sampled_has_top_p = False
+    talker.sub_sampled_has_unbounded_top_k = False
 
     assert (
         talker.precompute_npu_subtalker_gumbels(
@@ -6998,8 +6997,8 @@ def test_qwen3_tts_predictor_overwrites_reused_outputs(
     talker._predictor_k_cache = torch.empty(0, dtype=dtype)
     talker._output_codes = torch.full((5, 4), -1, dtype=torch.long)
     talker._output_embeds = torch.full((5, 8), float("nan"), dtype=dtype)
-    talker._sub_has_sampled_rows = False
-    talker._sub_batch_size = 5
+    talker.sub_has_sampled_rows = False
+    talker.sub_batch_size = 5
     embeddings = [
         torch.nn.Embedding.from_pretrained(
             (torch.arange(64).reshape(8, 8) / 16 + group).to(dtype)
@@ -7079,13 +7078,13 @@ def test_qwen3_tts_subtalker_sampling_uses_precomputed_gumbel(
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
     talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
-    talker._sub_temperature_tensor = torch.tensor([1.0])
-    talker._sub_top_p_tensor = torch.tensor([1.0])
-    talker._sub_top_k_tensor = torch.tensor([-1])
-    talker._sub_sampling_seed_tensor = torch.tensor([17])
-    talker._sub_sampled_has_top_p = False
-    talker._sub_sampled_max_top_k = 0
-    talker._sub_sampled_has_unbounded_top_k = True
+    talker.sub_temperature_tensor = torch.tensor([1.0])
+    talker.sub_top_p_tensor = torch.tensor([1.0])
+    talker.sub_top_k_tensor = torch.tensor([-1])
+    talker.sub_sampling_seed_tensor = torch.tensor([17])
+    talker.sub_sampled_has_top_p = False
+    talker.sub_sampled_max_top_k = 0
+    talker.sub_sampled_has_unbounded_top_k = True
 
     def fail_sampler(*args, **kwargs):
         del args, kwargs
