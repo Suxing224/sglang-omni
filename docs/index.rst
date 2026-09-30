@@ -92,6 +92,7 @@ Supported Models
    get_started/installation_npu.md
    get_started/installation_xpu.md
    get_started/installation_cpu.md
+   get_started/installation_musa.md
 
 
 .. toctree::
@@ -117,6 +118,7 @@ Supported Models
    cookbook/minicpm_o.md
    cookbook/ming_omni.md
    cookbook/nemotron_voicechat.md
+   cookbook/personaplex.md
    cookbook/llada2_uni.md
    cookbook/fun_cosyvoice3.md
    cookbook/auk.md
@@ -140,6 +142,7 @@ Supported Models
    :caption: Benchmarks
 
    benchmarks/relay.md
+   benchmarks/qwen3_tts_leading_silence.md
 
 
 .. toctree::

@@ -19,6 +19,7 @@ from typing import Any, Literal, Mapping
 
 import torch
 
+from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -33,7 +34,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     pad_flow_prompt_to_hop,
 )
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -119,6 +120,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
             max_batch_cost=max_batch_cost,
         )
 
+    def pump_one_step(self) -> list[str] | None:
+        with self.vocoder.stream_context:
+            return super().pump_one_step()
+
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
         return results[0]
@@ -133,8 +138,53 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note(ratish): one hop and one final through Flow and HiFT before the
         # stage publishes readiness, so the first request pays neither the
         # attention kernel load nor the f0 cast.
+        item = self.make_warmup_flow_input()
+        # note(ratish): under the vocoder's stream, so the warmup and not the
+        # first request builds that stream's memory pool and cuBLAS workspaces,
+        # which PyTorch keeps per stream.
+        started = time.monotonic()
+        with self.vocoder.stream_context:
+            mel = self.vocoder.hop_batch([item])[0]
+            self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
+            hop_s = time.monotonic() - started
+            mel = self.vocoder.leftover_batch([item])[0]
+            self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
+        final_s = time.monotonic() - started - hop_s
+        logger.info(
+            f"Fun-CosyVoice3 vocoder warmup: hop {hop_s:.1f} s, final {final_s:.1f} s"
+        )
+
+    def warmup_packed_dit_compile(self) -> None:
+        """Materialize PackedDiT contracts before the process becomes ready."""
+        packed_estimator = self.vocoder.flow.packed_estimator
+        if not isinstance(packed_estimator, PackedDiT):
+            raise RuntimeError(
+                "Fun-CosyVoice3 PackedDiT compile warmup requires a PackedDiT estimator"
+            )
+        else:
+            pass
+        if not packed_estimator.compile(self.vocoder.autocast_dtype):
+            return
+        else:
+            pass
+        item = self.make_warmup_flow_input()
+        started = time.monotonic()
+        try:
+            with self.vocoder.stream_context:
+                self.vocoder.hop_batch([item])
+                self.vocoder.leftover_batch([item])
+        except Exception:
+            packed_estimator.disable_compile()
+            raise
+        logger.info(
+            f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
+            f"during process startup with torch_num_threads="
+            f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
+        )
+
+    def make_warmup_flow_input(self) -> FlowBatchInput:
         flow = self.vocoder.flow
-        item = FlowBatchInput(
+        return FlowBatchInput(
             token=torch.zeros(
                 1, self.token_hop_len + PRE_LOOKAHEAD_LEN, dtype=torch.int32
             ),
@@ -143,16 +193,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 1, self.token_hop_len * TOKEN_MEL_RATIO, flow.output_size
             ),
             embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
-        )
-        started = time.monotonic()
-        mel = self.vocoder.hop_batch([item])[0]
-        self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
-        hop_s = time.monotonic() - started
-        mel = self.vocoder.leftover_batch([item])[0]
-        self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
-        final_s = time.monotonic() - started - hop_s
-        logger.info(
-            f"Fun-CosyVoice3 vocoder warmup: hop {hop_s:.1f} s, final {final_s:.1f} s"
         )
 
     def latch_stream_contract(
@@ -399,6 +439,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 )
                 if delta.numel() > 0:
                     decoded[request_id] = delta
+                else:
+                    pass
             now = self.clock()
             for request_id, state in participants:
                 state.token_offset += state.hop_len
@@ -409,6 +451,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 )
                 if request_id in decoded and state.first_emit_at is None:
                     state.first_emit_at = now
+                else:
+                    pass
                 if state.next_decode() != "wait":
                     state.ready_since = now
                 else:

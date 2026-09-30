@@ -2,12 +2,14 @@
 """Shared ServerArgs construction for SGLang AR engines."""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+from sglang_omni.utils.gpu_compat import apply_torch_compile_cache_env
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 _DECODE_CUDA_GRAPH_ALIASES = {
@@ -27,12 +29,16 @@ def normalize_decode_cuda_graph_overrides(kwargs: dict[str, Any]) -> None:
     for legacy_name, decode_name in _DECODE_CUDA_GRAPH_ALIASES.items():
         if legacy_name not in kwargs:
             continue
+        else:
+            pass
         legacy_value = kwargs.pop(legacy_name)
         if decode_name in kwargs and kwargs[decode_name] != legacy_value:
             raise ValueError(
                 f"Conflicting {legacy_name} and {decode_name} values: "
                 f"{legacy_value!r} != {kwargs[decode_name]!r}"
             )
+        else:
+            pass
         kwargs[decode_name] = legacy_value
 
 
@@ -45,6 +51,8 @@ def pin_resolved_device_type(overrides: dict[str, Any], resolved_type: str) -> N
             f"resolved to {resolved_type!r}. Drop the "
             f"override or set device={resolved_type!r}."
         )
+    else:
+        pass
     overrides["device"] = resolved_type
 
 
@@ -56,11 +64,17 @@ def apply_platform_decode_cuda_graph_backend(kwargs: dict[str, Any]) -> None:
     backend = current_platform.get_decode_cuda_graph_backend()
     if backend is None:
         return
+    else:
+        pass
     device = str(kwargs.get("device") or "").split(":")[0]
     if device != current_platform.device_type:
         return
+    else:
+        pass
     if kwargs.get("disable_cuda_graph") or kwargs.get("disable_decode_cuda_graph"):
         return
+    else:
+        pass
     kwargs.setdefault("cuda_graph_backend_decode", backend)
 
 
@@ -88,6 +102,8 @@ def build_sglang_server_args(
     }
     if mem_fraction_static is not None:
         kwargs["mem_fraction_static"] = mem_fraction_static
+    else:
+        pass
     kwargs.update(overrides)
     normalize_decode_cuda_graph_overrides(kwargs)
     # Existing Omni models remain eager-prefill by default. Models that have
@@ -96,7 +112,17 @@ def build_sglang_server_args(
     kwargs.setdefault("cuda_graph_backend_prefill", CudaGraphBackend.DISABLED)
     if kwargs.get("mem_fraction_static") is None:
         kwargs.pop("mem_fraction_static", None)
+    else:
+        pass
     kwargs.setdefault("device", platform_device_type())
+    if kwargs.get("enable_torch_compile") is None:
+        # note (zhaochenyang20): CI sets 0 to keep the eager baseline its speed thresholds use.
+        kwargs["enable_torch_compile"] = (
+            os.environ.get("SGLANG_OMNI_TORCH_COMPILE_DEFAULT", "1") != "0"
+        )
+    else:
+        pass
+    apply_torch_compile_cache_env()
     apply_platform_decode_cuda_graph_backend(kwargs)
     server_args = ServerArgs(**kwargs)
     server_args.resolve_once()
@@ -105,6 +131,8 @@ def build_sglang_server_args(
     # chunked prefill stays allowed (the bridge handles it natively).
     if resolved.enable_dp_attention:
         raise ValueError("sglang-omni does not support enable_dp_attention")
+    else:
+        pass
     # note (ratish): NVLS is controlled through the process environment and
     # symmetric memory is never set up, so either flag would run without effect.
     if resolved.enable_nccl_nvls or resolved.enable_symm_mem:
@@ -113,6 +141,8 @@ def build_sglang_server_args(
             "NVLS is enabled with NCCL_NVLS_ENABLE=1 in the shell or the stage "
             "env. Symmetric memory is not available."
         )
+    else:
+        pass
     # Overlapped startup weight load leaves sentinel weights until the scheduler
     # calls finalize_startup_weight_load after capture; omni's bootstrap never
     # does, so profiling, weight sharing and capture would run on the sentinels.
@@ -120,6 +150,8 @@ def build_sglang_server_args(
         raise ValueError(
             "sglang-omni does not support startup_weight_load_mode='overlap'"
         )
+    else:
+        pass
     # note (ratish): the bootstrap allocates the KV pool without the
     # resident-weight accounting an IPC-cached engine needs.
     if resolved.weight_cache_mode != "off":
@@ -127,6 +159,8 @@ def build_sglang_server_args(
             "sglang-omni does not support "
             f"weight_cache_mode={resolved.weight_cache_mode!r}"
         )
+    else:
+        pass
     return server_args
 
 
@@ -137,13 +171,19 @@ def apply_encoder_mem_reserve(
     """Subtract Qwen external encoder headroom from an auto-selected SGLang budget."""
     if not 0.0 <= encoder_mem_reserve < 1.0:
         raise ValueError("encoder_mem_reserve must be in [0, 1)")
+    else:
+        pass
     if encoder_mem_reserve == 0:
         return
+    else:
+        pass
 
     cfg = resolved_view(server_args)
     current = cfg.mem_fraction_static
     if current is None:
         return
+    else:
+        pass
 
     reserved = current - encoder_mem_reserve
     if reserved < 0.1:
@@ -153,6 +193,8 @@ def apply_encoder_mem_reserve(
             "floor 0.1; lower encoder_mem_reserve or pin mem_fraction_static "
             "explicitly."
         )
+    else:
+        pass
     override_server_args(
         server_args,
         "sglang_omni.encoder_mem_reserve",

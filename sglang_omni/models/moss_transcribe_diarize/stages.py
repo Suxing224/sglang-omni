@@ -33,6 +33,8 @@ def missing_additional_chat_templates_compat() -> Iterator[None]:
         original = getattr(module, "list_repo_templates", None)
         if original is None:
             return
+        else:
+            pass
 
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
@@ -40,6 +42,8 @@ def missing_additional_chat_templates_compat() -> Iterator[None]:
             except RepositoryNotFoundError as exc:
                 if "additional_chat_templates" in str(exc):
                     return []
+                else:
+                    pass
                 raise
 
         module.list_repo_templates = wrapped
@@ -80,7 +84,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     mem_fraction_static: float | None = 0.80,
     mm_embedding_cache_size_bytes: int = 0,
     encoder_cache_size_bytes: int = 0,
-    enable_torch_compile: bool = False,
+    enable_torch_compile: bool | None = None,
     torch_compile_max_bs: int = 4,
     # note (yichi): MOSS-TD overlaps host collect starting at batch size 1;
     # --asr.factory.enable_async_decode false remains the operator opt-out.

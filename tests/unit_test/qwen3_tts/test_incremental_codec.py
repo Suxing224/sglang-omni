@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 
 import pytest
@@ -18,9 +19,10 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     incremental_transformer,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.utils import snake_beta
 
 
-def _random_partitions(total: int, seed: int) -> list[int]:
+def random_partitions(total: int, seed: int) -> list[int]:
     generator = random.Random(seed)
     partitions = []
     while total:
@@ -30,7 +32,7 @@ def _random_partitions(total: int, seed: int) -> list[int]:
     return partitions
 
 
-class _CausalConv(nn.Module):
+class CausalConv(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -54,7 +56,7 @@ class _CausalConv(nn.Module):
         return self.conv(F.pad(hidden_states, (self.padding, 0))).contiguous()
 
 
-class _CausalTransConv(nn.Module):
+class CausalTransConv(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -73,7 +75,7 @@ class _CausalTransConv(nn.Module):
         return output[..., : -self.right_pad] if self.right_pad else output
 
 
-class _RotaryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -90,7 +92,7 @@ class _RotaryEmbedding(nn.Module):
         return embeddings.cos(), embeddings.sin()
 
 
-class _Attention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, hidden_size: int, head_dim: int, window_size: int) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -105,11 +107,11 @@ class _Attention(nn.Module):
         self.k_norm = nn.Identity()
 
 
-class _TransformerLayer(nn.Module):
+class TransformerLayer(nn.Module):
     def __init__(self, hidden_size: int, head_dim: int, window_size: int) -> None:
         super().__init__()
         self.input_layernorm = nn.LayerNorm(hidden_size)
-        self.self_attn = _Attention(hidden_size, head_dim, window_size)
+        self.self_attn = Attention(hidden_size, head_dim, window_size)
         self.self_attn_layer_scale = nn.Identity()
         self.post_attention_layernorm = nn.LayerNorm(hidden_size)
         self.mlp = nn.Sequential(
@@ -120,26 +122,26 @@ class _TransformerLayer(nn.Module):
         self.mlp_layer_scale = nn.Identity()
 
 
-class _Transformer(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, latent_dim: int = 2, hidden_size: int = 4) -> None:
         super().__init__()
         self.input_proj = nn.Linear(latent_dim, hidden_size)
-        self.layers = nn.ModuleList([_TransformerLayer(hidden_size, 2, 4)])
+        self.layers = nn.ModuleList([TransformerLayer(hidden_size, 2, 4)])
         self.norm = nn.LayerNorm(hidden_size)
         self.output_proj = nn.Linear(hidden_size, latent_dim)
-        self.rotary_emb = _RotaryEmbedding(2)
+        self.rotary_emb = RotaryEmbedding(2)
         self.window_size = 4
 
 
-class _Quantizer(nn.Module):
+class Quantizer(nn.Module):
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         return codes[:, :2].to(torch.float32) / 16.0
 
 
-class _ConvNeXt(nn.Module):
+class ConvNeXt(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.dwconv = _CausalConv(channels, channels, 7, groups=channels)
+        self.dwconv = CausalConv(channels, channels, 7, groups=channels)
         self.norm = nn.LayerNorm(channels)
         self.pwconv1 = nn.Linear(channels, channels * 4)
         self.act = nn.GELU()
@@ -154,13 +156,13 @@ class _ConvNeXt(nn.Module):
         return residual + hidden_states.permute(0, 2, 1)
 
 
-class _ResidualUnit(nn.Module):
+class ResidualUnit(nn.Module):
     def __init__(self, channels: int, dilation: int) -> None:
         super().__init__()
         self.act1 = nn.Tanh()
-        self.conv1 = _CausalConv(channels, channels, 7, dilation=dilation)
+        self.conv1 = CausalConv(channels, channels, 7, dilation=dilation)
         self.act2 = nn.Tanh()
-        self.conv2 = _CausalConv(channels, channels, 1)
+        self.conv2 = CausalConv(channels, channels, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
@@ -169,16 +171,16 @@ class _ResidualUnit(nn.Module):
         return hidden_states + residual
 
 
-class _DecoderBlock(nn.Module):
+class DecoderBlock(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.block = nn.ModuleList(
             [
                 nn.Tanh(),
-                _CausalTransConv(4, 2, 4, 2),
-                _ResidualUnit(2, 1),
-                _ResidualUnit(2, 3),
-                _ResidualUnit(2, 9),
+                CausalTransConv(4, 2, 4, 2),
+                ResidualUnit(2, 1),
+                ResidualUnit(2, 3),
+                ResidualUnit(2, 9),
             ]
         )
 
@@ -188,30 +190,30 @@ class _DecoderBlock(nn.Module):
         return hidden_states
 
 
-class _Decoder(nn.Module):
+class Decoder(nn.Module):
     total_upsample = 4
 
     def __init__(self) -> None:
         super().__init__()
-        self.quantizer = _Quantizer()
-        self.pre_conv = _CausalConv(2, 2, 3)
-        self.pre_transformer = _Transformer()
+        self.quantizer = Quantizer()
+        self.pre_conv = CausalConv(2, 2, 3)
+        self.pre_transformer = Transformer()
         self.upsample = nn.ModuleList(
-            [nn.ModuleList([_CausalTransConv(2, 2, 2, 2), _ConvNeXt(2)])]
+            [nn.ModuleList([CausalTransConv(2, 2, 2, 2), ConvNeXt(2)])]
         )
         self.decoder = nn.ModuleList(
             [
-                _CausalConv(2, 4, 7),
-                _DecoderBlock(),
+                CausalConv(2, 4, 7),
+                DecoderBlock(),
                 nn.Tanh(),
-                _CausalConv(2, 1, 7),
+                CausalConv(2, 1, 7),
             ]
         )
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         hidden_states = self.quantizer.decode(codes)
         hidden_states = self.pre_conv(hidden_states).transpose(1, 2)
-        hidden_states = _full_transformer(self.pre_transformer, hidden_states).permute(
+        hidden_states = full_transformer(self.pre_transformer, hidden_states).permute(
             0, 2, 1
         )
         for modules in self.upsample:
@@ -223,8 +225,8 @@ class _Decoder(nn.Module):
         return waveform.clamp(min=-1, max=1)
 
 
-def _full_transformer(
-    transformer: _Transformer, hidden_states: torch.Tensor
+def full_transformer(
+    transformer: Transformer, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     hidden_states = transformer.input_proj(hidden_states)
     length = int(hidden_states.shape[1])
@@ -276,7 +278,7 @@ def test_incremental_causal_conv_matches_whole(
     partitions: list[int],
 ) -> None:
     torch.manual_seed(1)
-    module = _CausalConv(2, 3, 7, dilation=3)
+    module = CausalConv(2, 3, 7, dilation=3)
     inputs = torch.randn(1, 2, sum(partitions))
     expected = module(inputs)
     state = Qwen3TTSIncrementalCodecState()
@@ -299,7 +301,7 @@ def test_incremental_causal_transconv_matches_whole(
     partitions: list[int],
 ) -> None:
     torch.manual_seed(2)
-    module = _CausalTransConv(2, 3, 8, 4)
+    module = CausalTransConv(2, 3, 8, 4)
     inputs = torch.randn(1, 2, sum(partitions))
     expected = module(inputs)
     state = Qwen3TTSIncrementalCodecState()
@@ -322,9 +324,9 @@ def test_incremental_transformer_matches_whole_across_window(
     partitions: list[int],
 ) -> None:
     torch.manual_seed(3)
-    transformer = _Transformer()
+    transformer = Transformer()
     inputs = torch.randn(1, sum(partitions), 2)
-    expected = _full_transformer(transformer, inputs)
+    expected = full_transformer(transformer, inputs)
     state = Qwen3TTSIncrementalCodecState()
     actual = []
     offset = 0
@@ -372,13 +374,13 @@ def test_incremental_codec_state_clone_owns_tensor_storage() -> None:
 
 @pytest.mark.parametrize(
     "partitions",
-    [[11], [1] * 11, [1, 10], [10, 1], [3, 2, 6], _random_partitions(96, 5)],
+    [[11], [1] * 11, [1, 10], [10, 1], [3, 2, 6], random_partitions(96, 5)],
 )
 def test_incremental_decoder_matches_whole_for_arbitrary_partitions(
     partitions: list[int],
 ) -> None:
     torch.manual_seed(4)
-    decoder = _Decoder()
+    decoder = Decoder()
     codes = torch.randint(0, 16, (1, 2, sum(partitions)))
     expected = decoder(codes)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
@@ -398,7 +400,7 @@ def test_incremental_decoder_matches_whole_for_arbitrary_partitions(
 
 def test_incremental_decoder_reference_prefix_matches_generated_waveform() -> None:
     torch.manual_seed(5)
-    decoder = _Decoder()
+    decoder = Decoder()
     codes = torch.randint(0, 16, (1, 2, 9))
     reference_frames = 4
     expected = decoder(codes)[..., reference_frames * decoder.total_upsample :]
@@ -415,7 +417,7 @@ def test_incremental_decoder_reference_prefix_matches_generated_waveform() -> No
 
 
 def test_incremental_decoder_rejects_malformed_codes() -> None:
-    decoder = _Decoder()
+    decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     state = Qwen3TTSIncrementalCodecState()
 
@@ -428,7 +430,7 @@ def test_incremental_decoder_rejects_malformed_codes() -> None:
 def test_incremental_decoder_batches_rows_sharing_a_position() -> None:
     """A batch of identical-position rows must equal the same rows decoded alone."""
     torch.manual_seed(11)
-    decoder = _Decoder()
+    decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     codes = torch.randint(0, 16, (3, 2, 6))
 
@@ -445,7 +447,7 @@ def test_incremental_decoder_batches_rows_sharing_a_position() -> None:
     assert batched_state.frame_positions.tolist() == [6, 6, 6]
 
 
-def _arena_decode(
+def arena_decode(
     incremental: Qwen3TTSIncrementalDecoder,
     arena: Qwen3TTSCodecStateArena,
     slots: list[int],
@@ -460,8 +462,8 @@ def _arena_decode(
     return waveform
 
 
-def _make_arena(
-    decoder: _Decoder, slots: int = 4
+def make_arena(
+    decoder: Decoder, slots: int = 4
 ) -> tuple[Qwen3TTSIncrementalDecoder, Qwen3TTSCodecStateArena]:
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(
@@ -488,7 +490,7 @@ def test_codec_state_arena_stages_indices_on_npu() -> None:
 def test_state_spec_covers_every_key_the_decode_creates() -> None:
     """The arena preallocates from the spec, so it must match what decode uses."""
     torch.manual_seed(12)
-    decoder = _Decoder()
+    decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     spec = incremental.state_spec()
 
@@ -516,8 +518,8 @@ def test_arena_backed_decode_matches_the_lazy_state() -> None:
     the whole-sequence parity tests above already pin to the reference decoder.
     """
     torch.manual_seed(13)
-    decoder = _Decoder()
-    incremental, arena = _make_arena(decoder)
+    decoder = Decoder()
+    incremental, arena = make_arena(decoder)
     codes = torch.randint(0, 16, (1, 2, 11))
     partitions = [2, 1, 5, 3]
 
@@ -530,7 +532,7 @@ def test_arena_backed_decode_matches_the_lazy_state() -> None:
     for length in partitions:
         chunk = codes[..., offset : offset + length]
         expected = incremental.decode(chunk, lazy_state)
-        actual = _arena_decode(incremental, arena, [slot], [position], chunk)
+        actual = arena_decode(incremental, arena, [slot], [position], chunk)
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
         offset += length
         position += length
@@ -544,8 +546,8 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
     every row must match what it produces decoded on its own.
     """
     torch.manual_seed(14)
-    decoder = _Decoder()
-    incremental, arena = _make_arena(decoder, slots=8)
+    decoder = Decoder()
+    incremental, arena = make_arena(decoder, slots=8)
 
     warmups = [0, 3, 9]
     fresh = 2
@@ -562,13 +564,13 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
         for index in range(warmup):
             chunk = stream[..., index : index + 1]
             for slot in (cohort_slot, solo_slot):
-                _arena_decode(incremental, arena, [slot], [index], chunk)
+                arena_decode(incremental, arena, [slot], [index], chunk)
 
     expected = [
-        _arena_decode(incremental, arena, [slot], [warmup], stream[..., warmup:])
+        arena_decode(incremental, arena, [slot], [warmup], stream[..., warmup:])
         for slot, warmup, stream in zip(solo_slots, warmups, streams)
     ]
-    batched = _arena_decode(
+    batched = arena_decode(
         incremental,
         arena,
         cohort_slots,
@@ -597,7 +599,7 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
 
     torch.manual_seed(17)
     device = torch.device("cuda", torch.cuda.current_device())
-    decoder = _Decoder().to(device).eval()
+    decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(
         incremental, num_slots=batch_bucket + 1, device=device, dtype=torch.float32
@@ -677,7 +679,7 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
 
     torch.manual_seed(18)
     device = torch.device("cuda", torch.cuda.current_device())
-    decoder = _Decoder().to(device).eval()
+    decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(
         incremental, num_slots=5, device=device, dtype=torch.float32
@@ -694,7 +696,7 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
         arena=arena,
     )
     runner.capture()
-    assert len(runner._graphs) == 2
+    assert len(runner.graphs) == 2
     slots = {1: [arena.acquire()], 4: [arena.acquire() for _ in range(4)]}
     eager_states = {
         batch_size: arena.gather(rows) for batch_size, rows in slots.items()
@@ -737,28 +739,28 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
 
 def test_arena_slot_reuse_starts_from_a_cold_state() -> None:
     torch.manual_seed(15)
-    decoder = _Decoder()
-    incremental, arena = _make_arena(decoder, slots=1)
+    decoder = Decoder()
+    incremental, arena = make_arena(decoder, slots=1)
     codes = torch.randint(0, 16, (1, 2, 3))
 
     slot = arena.acquire()
     assert slot == 0
-    cold = _arena_decode(incremental, arena, [slot], [0], codes)
-    _arena_decode(incremental, arena, [slot], [3], codes)
+    cold = arena_decode(incremental, arena, [slot], [0], codes)
+    arena_decode(incremental, arena, [slot], [3], codes)
     assert arena.active_slots() == 1
 
     arena.release(slot)
     assert arena.active_slots() == 0
     reused = arena.acquire()
     assert reused == slot
-    again = _arena_decode(incremental, arena, [reused], [0], codes)
+    again = arena_decode(incremental, arena, [reused], [0], codes)
 
     torch.testing.assert_close(again, cold)
 
 
 def test_arena_reports_exhaustion_and_retirement() -> None:
-    decoder = _Decoder()
-    _, arena = _make_arena(decoder, slots=1)
+    decoder = Decoder()
+    _, arena = make_arena(decoder, slots=1)
 
     slot = arena.acquire()
     assert slot is not None
@@ -778,7 +780,7 @@ def test_arena_reports_exhaustion_and_retirement() -> None:
     assert arena.describe()["bytes_per_slot"] == arena.bytes_per_slot
 
 
-def _fresh_state(rows: int) -> Qwen3TTSIncrementalCodecState:
+def fresh_state(rows: int) -> Qwen3TTSIncrementalCodecState:
     state = Qwen3TTSIncrementalCodecState()
     state.frame_positions = torch.zeros(rows, dtype=torch.long)
     return state
@@ -788,7 +790,7 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(6)
-    decoder = _Decoder()
+    decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     calls: list[tuple[int, int]] = []
 
@@ -802,8 +804,8 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
     monkeypatch.setattr(torch, "compile", fake_compile)
     trace_codes = torch.randint(0, 16, (2, 2, 3))
     with torch.inference_mode():
-        incremental.precompile(trace_codes, _fresh_state(2))
-        incremental.precompile(trace_codes, _fresh_state(2))
+        incremental.precompile(trace_codes, fresh_state(2))
+        incremental.precompile(trace_codes, fresh_state(2))
     assert calls == [(2, 3)], "precompile traces a shape once, on the given tensors"
 
     codes = torch.randint(0, 16, (2, 2, 9))
@@ -841,7 +843,7 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
 
     torch.manual_seed(7)
     device = torch.device("cuda", torch.cuda.current_device())
-    decoder = _Decoder().to(device)
+    decoder = Decoder().to(device)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(
         incremental, num_slots=3, device=device, dtype=torch.float32
@@ -918,7 +920,7 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state() -> None:
 
     torch.manual_seed(23)
     device = torch.device("cuda", torch.cuda.current_device())
-    decoder = _Decoder().to(device).eval()
+    decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(
         incremental, num_slots=4, device=device, dtype=torch.float32
@@ -953,7 +955,7 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler.__new__(
         Qwen3TTSStreamingVocoderScheduler
     )
-    scheduler._samples_per_frame = decoder.total_upsample
+    scheduler.samples_per_frame = decoder.total_upsample
     plans = [
         IncrementalDecodePlan(
             decoder_input=codes[0:1],
@@ -1004,3 +1006,56 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state() -> None:
                 graph_mapping[key], eager_mapping[key], rtol=2e-4, atol=2e-5
             )
     assert arena.gather([bystander]).frame_positions.tolist() == [0]
+
+
+@pytest.mark.benchmark
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
+    checkpoint = os.environ.get("QWEN3_TTS_TOKENIZER_PATH")
+    if checkpoint is None:
+        pytest.skip("Set QWEN3_TTS_TOKENIZER_PATH to run the real checkpoint gate")
+    from sglang_omni.models.qwen3_tts.compat import (
+        apply_qwen_tts_transformers_compatibility_patches,
+    )
+    from sglang_omni.models.qwen3_tts.incremental_codec import (
+        Qwen3TTSIncrementalCodecState,
+        Qwen3TTSIncrementalDecoder,
+    )
+
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts import Qwen3TTSTokenizer
+
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        checkpoint,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
+    decoder = tokenizer.model.decoder.eval()
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    codes = [
+        torch.randint(
+            decoder.config.codebook_size,
+            (batch, decoder.config.num_quantizers, frames),
+            device="cuda:0",
+            generator=generator,
+        )
+        for batch, frames in ((1, 2), (1, 24), (1, 35), (8, 24))
+    ]
+    with torch.inference_mode():
+        expected = [decoder(value).clone() for value in codes]
+        incremental = Qwen3TTSIncrementalDecoder(decoder)
+        state = Qwen3TTSIncrementalCodecState()
+        parts = codes[1].split((2, 6, 8, 8), dim=-1)
+        incremental_expected = [
+            incremental.decode(part, state).clone() for part in parts
+        ]
+
+        assert snake_beta.fuse_vocoder_decoder(decoder) == 29
+        for value, pcm in zip(codes, expected):
+            assert torch.equal(decoder(value), pcm), tuple(value.shape)
+        incremental = Qwen3TTSIncrementalDecoder(decoder)
+        state = Qwen3TTSIncrementalCodecState()
+        for part, pcm in zip(parts, incremental_expected):
+            assert torch.equal(incremental.decode(part, state), pcm)
