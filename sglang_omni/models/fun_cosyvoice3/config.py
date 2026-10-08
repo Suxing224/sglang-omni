@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from pydantic import Field
 
@@ -13,6 +13,7 @@ from sglang_omni.config import (
     PipelineConfig,
     StageConfig,
 )
+from sglang_omni.config.schema import stage_process_name
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
 
@@ -160,6 +161,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 max_batch_size=16,
                 max_batch_wait_ms=30,
                 enable_flow_cuda_graph=True,
+                enable_flow_prefix_cuda_graph=True,
                 flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
                 # note (guozhihao-224, chenyang):
                 # CUDA Graph and DiT torch.compile are on by default. TensorRT stays opt-in;
@@ -168,6 +170,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 token_hop_len=25,
                 token_max_hop_len=100,
                 disable_hop_growth=False,
+                flow_prefix_cache_gb=24.0,
             ),
             gpu=0,
             terminal=True,
@@ -188,21 +191,32 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
         ),
     ]
 
-    def model_post_init(self, __context: Any = None) -> None:
+    def resolved_stage_env_defaults(self, stage_name: str) -> dict[str, str]:
+        env_defaults = super().resolved_stage_env_defaults(stage_name)
+        if (
+            type(self).stage_config_cls(stage_name).engine_stage
+            and "OMP_NUM_THREADS" not in env_defaults
+        ):
+            process_name = stage_process_name(self.stage_named(stage_name))
+            # note (Richard Wang): a value written on any stage of the process wins.
+            if not any(
+                "OMP_NUM_THREADS" in stage.env
+                for stage in self.stages
+                if stage_process_name(stage) == process_name
+            ):
+                # note(chenye): SGLang pins Torch CPU threads to 1 for its GPU process.
+                # Apply the same policy at spawn to every stage colocated with the engine.
+                env_defaults["OMP_NUM_THREADS"] = "1"
+            else:
+                pass
+        else:
+            pass
+        return env_defaults
+
+    def model_post_init(self, __context: object = None) -> None:
         # TODO (chenyang): Indeed, TRT and Torch compile conflicts are pretty
         # common in this repo, so we should make this into config level, not in each model.
         super().model_post_init(__context)
-        if "OMP_NUM_THREADS" not in self.env_defaults:
-            config_cls = type(self)
-            for stage in self.stages:
-                if config_cls.stage_config_cls(stage.name).engine_stage:
-                    # note(chenye): SGLang pins Torch CPU threads to 1 for its GPU process.
-                    # Apply the same policy at spawn to every stage colocated with the engine.
-                    stage.env.setdefault("OMP_NUM_THREADS", "1")
-                else:
-                    pass
-        else:
-            pass
         vocoder = next(stage for stage in self.stages if stage.name == "vocoder")
         extras = vocoder.factory.model_extra
         # note(ratish): only explicit flags reach here;
@@ -212,7 +226,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             enable_flow_estimator_trt=bool(extras.get("enable_flow_estimator_trt")),
         )
 
-    def stage_factory_kwargs(self, stage_name: str) -> dict[str, Any]:
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, bool | str]:
         if stage_name != "vocoder":
             return {}
         else:
@@ -220,7 +234,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
         vocoder_factory = self.stage_named("vocoder").factory
         # note(ratish): the resolver reads a stage literal back as an explicit choice;
         # a set enable_dit_torch_compile overrides this default.
-        kwargs: dict[str, Any] = {
+        kwargs: dict[str, bool | str] = {
             "enable_dit_torch_compile": not bool(
                 vocoder_factory.model_extra.get("enable_flow_estimator_trt")
             )
