@@ -580,7 +580,7 @@ def test_qwen3_tts_0_6b_base_npu_config_uses_conservative_vocoder_defaults() -> 
     assert vocoder.max_batch_size == 8
     assert vocoder.initial_max_batch_size == 1
     assert vocoder.followup_max_batch_size == 1
-    assert vocoder.async_decode is None
+    assert getattr(vocoder, "async_decode", None) is None
 
 
 @pytest.mark.parametrize(
@@ -7387,6 +7387,7 @@ def test_qwen3_tts_predictor_overwrites_reused_outputs(
     talker.predictor_k_cache = torch.empty(0, dtype=dtype)
     talker.output_codes = torch.full((5, 4), -1, dtype=torch.long)
     talker.output_embeds = torch.full((5, 8), float("nan"), dtype=dtype)
+    talker.predictor_projected_embeddings = None
     talker.sub_has_sampled_rows = False
     talker.sub_batch_size = 5
     embeddings = [
@@ -8870,6 +8871,7 @@ def test_qwen3_tts_scheduler_adopts_prepared_tensors_after_the_preprocessing_eve
     monkeypatch.setattr(
         torch.Tensor, "device", property(lambda tensor: torch.device("cuda"))
     )
+    monkeypatch.setattr(torch, "get_device_module", lambda device: torch.cuda)
 
     ready = object()
     embeds = torch.zeros((3, 4))

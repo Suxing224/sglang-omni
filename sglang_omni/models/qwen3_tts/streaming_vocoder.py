@@ -11,7 +11,7 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import count
-from typing import TYPE_CHECKING, Any, Literal, Mapping, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, Mapping, TypeVar, overload
 
 import numpy as np
 import torch
@@ -2930,7 +2930,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 pass
             self.run_followup_batch(batch)
 
-    def activate_decode_worker(self, stream: Any | None) -> None:
+    def activate_decode_worker(self, stream: torch.Stream | None) -> None:
         """Bind a background decode worker to the scheduler's device."""
         if self.device.type == "npu":
             current_platform.set_device(self.device)
