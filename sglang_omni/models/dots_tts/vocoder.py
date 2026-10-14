@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 
 import torch
 
@@ -443,9 +444,29 @@ class DotsTTSStreamingVocoder(
             pool.graph_runner = (
                 self.capture_step_graphs(pool)
                 if self.enable_streaming_audio_vae_cuda_graph
-                and pool.device.type == "cuda"
+                and pool.device.type in {"cuda", "npu"}
                 else None
             )
+            if pool.device.type == "npu" and pool.graph_runner is not None:
+                patch_frames = self.codec.patch_size
+                merged_frames = patch_frames * self.merge_steps
+                decoder_shapes = {
+                    patch_frames: patch_frames,
+                    patch_frames * 2: patch_frames,
+                    patch_frames * 2 + merged_frames: merged_frames,
+                    patch_frames * 2 + merged_frames * 2: merged_frames,
+                }
+                for decoder_frames, latent_frames in decoder_shapes.items():
+                    if decoder_frames < pool.window_size:
+                        pool.prefix_graph_runners[decoder_frames] = (
+                            self.capture_step_graphs(
+                                pool, decoder_shape=(decoder_frames, latent_frames)
+                            )
+                        )
+                    else:
+                        pass
+            else:
+                pass
             self.slot_pool = pool
             logger.info(
                 f"dots.tts streaming vocoder slot pool ready: "
@@ -456,13 +477,29 @@ class DotsTTSStreamingVocoder(
             pass
         return self.slot_pool
 
-    def capture_step_graphs(self, pool: DotsVocoderSlotPool) -> DotsVocoderGraphRunner:
+    def capture_step_graphs(
+        self,
+        pool: DotsVocoderSlotPool,
+        *,
+        decoder_shape: tuple[int, int] | None = None,
+    ) -> DotsVocoderGraphRunner:
+        if decoder_shape is None:
+            forward = pool.forward
+            capture_keys = self.cuda_graph_capture_keys()
+        else:
+            decoder_frames, latent_frames = decoder_shape
+            forward = partial(pool.forward, decoder_window_frames=decoder_frames)
+            capture_keys = [
+                capture_key
+                for capture_key in self.cuda_graph_capture_keys()
+                if capture_key[1] == latent_frames
+            ]
         runner = DotsVocoderGraphRunner(
-            forward=pool.forward,
+            forward=forward,
             new_inputs=pool.new_step_inputs,
             device=pool.device,
         )
-        runner.capture(self.cuda_graph_capture_keys())
+        runner.capture(capture_keys)
         return runner
 
     def cuda_graph_capture_keys(self) -> list[tuple[int, int]]:
@@ -479,7 +516,13 @@ class DotsTTSStreamingVocoder(
     @property
     def cuda_graph_count(self) -> int:
         runner = None if self.slot_pool is None else self.slot_pool.graph_runner
-        return 0 if runner is None else len(runner.captured_keys)
+        if runner is None:
+            return 0
+        else:
+            return len(runner.captured_keys) + sum(
+                len(prefix_runner.captured_keys)
+                for prefix_runner in self.slot_pool.prefix_graph_runners.values()
+            )
 
     def ensure_slot(self, state: DotsStreamState) -> None:
         if state.slot is not None:

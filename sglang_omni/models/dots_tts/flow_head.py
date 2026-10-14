@@ -13,6 +13,7 @@ from einops import rearrange
 from torch import nn
 
 from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.utils.cuda_staging import new_device_event
 
 if TYPE_CHECKING:
     from dots_tts.modules.backbone.dit_inference import DiTSolver, DiTSolverState
@@ -117,9 +118,9 @@ class DotsTTSFlowHead(nn.Module):
         self.tail: DotsTtsAcousticTail | None = None
         self.batched_nfe: int | None = None
         self.eos_pinned: torch.Tensor | None = None
-        self.eos_event: torch.cuda.Event | None = None
+        self.eos_event: torch.Event | None = None
         self.batched_eos_pinned: torch.Tensor | None = None
-        self.batched_eos_event: torch.cuda.Event | None = None
+        self.batched_eos_event: torch.Event | None = None
         self.batched_eos_host: list[bool] | None = None
         self.batched_eos_pending: int = 0
 
@@ -573,14 +574,18 @@ class DotsTTSFlowHead(nn.Module):
                 .gt(float(eos_threshold))
                 .reshape(())
             )
-            if eos_hit.is_cuda:
+            if eos_hit.device.type in {"cuda", "npu"}:
                 if self.eos_pinned is None:
                     self.eos_pinned = torch.zeros((), dtype=torch.bool, pin_memory=True)
-                    self.eos_event = torch.cuda.Event()
+                    self.eos_event = new_device_event(eos_hit.device)
                 else:
                     pass
                 self.eos_pinned.copy_(eos_hit, non_blocking=True)
-                self.eos_event.record()
+                self.eos_event.record(
+                    torch.get_device_module(eos_hit.device).current_stream(
+                        eos_hit.device
+                    )
+                )
             else:
                 pass
         else:
@@ -628,7 +633,7 @@ class DotsTTSFlowHead(nn.Module):
         )
         if eos_hit is None:
             finished = False
-        elif eos_hit.is_cuda:
+        elif eos_hit.device.type in {"cuda", "npu"}:
             self.eos_event.synchronize()
             finished = bool(self.eos_pinned.item())
         else:
@@ -755,7 +760,7 @@ class DotsTTSFlowHead(nn.Module):
         """Reset pending EOS staging and size the pinned buffer at init."""
         self.batched_eos_pending = 0
         self.batched_eos_host = None
-        if device.type != "cuda" or capacity <= 0:
+        if device.type not in {"cuda", "npu"} or capacity <= 0:
             self.batched_eos_pinned = None
             self.batched_eos_event = None
             return
@@ -764,7 +769,7 @@ class DotsTTSFlowHead(nn.Module):
         self.ensure_batched_eos_capacity(capacity, device)
 
     def ensure_batched_eos_capacity(self, capacity: int, device: torch.device) -> None:
-        if device.type != "cuda" or capacity <= 0:
+        if device.type not in {"cuda", "npu"} or capacity <= 0:
             return
         else:
             pass
@@ -775,7 +780,7 @@ class DotsTTSFlowHead(nn.Module):
             self.batched_eos_pinned = torch.zeros(
                 capacity, dtype=torch.bool, pin_memory=True
             )
-            self.batched_eos_event = torch.cuda.Event()
+            self.batched_eos_event = new_device_event(device)
         else:
             pass
 
@@ -793,14 +798,16 @@ class DotsTTSFlowHead(nn.Module):
             return
         else:
             pass
-        if eos_hits.is_cuda:
+        if eos_hits.device.type in {"cuda", "npu"}:
             self.ensure_batched_eos_capacity(n, eos_hits.device)
             assert self.batched_eos_pinned is not None
             assert self.batched_eos_event is not None
             self.batched_eos_pinned[:n].copy_(
                 eos_hits.to(dtype=torch.bool), non_blocking=True
             )
-            self.batched_eos_event.record()
+            self.batched_eos_event.record(
+                torch.get_device_module(eos_hits.device).current_stream(eos_hits.device)
+            )
             self.batched_eos_host = None
         else:
             self.batched_eos_host = [bool(value) for value in eos_hits.tolist()]

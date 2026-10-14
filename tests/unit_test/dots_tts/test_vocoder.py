@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from types import SimpleNamespace
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+import sglang_omni.models.dots_tts.codec as codec_module
+from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.models.dots_tts.npu_vocoder import (
+    adapt_audio_vae_convolutions,
+    decoder_forward,
+)
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.vocoder import (
     DotsTTSBatchVocoder,
@@ -16,6 +24,72 @@ from sglang_omni.models.dots_tts.vocoder import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
+
+import_dots_tts()
+
+from dots_tts.modules.backbone.layers import Conv1d, ConvTranspose1d
+from dots_tts.modules.vocoder.alias_free_filter import LowPassFilter1d
+from dots_tts.modules.vocoder.alias_free_resample import UpSample1d
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("fixed_filter", [True, False])
+def test_audio_vae_convolution_adapters_preserve_waveforms(
+    causal: bool, fixed_filter: bool
+) -> None:
+    torch.manual_seed(17)
+    convolutions = torch.nn.ModuleList(
+        [
+            Conv1d(4, 4, 3, dilation=2, groups=4, causal=causal),
+            ConvTranspose1d(4, 4, 4, stride=2, groups=4, causal=causal),
+            UpSample1d(channels=4, causal=causal, fixed_filter=fixed_filter),
+            LowPassFilter1d(
+                channels=4, causal=causal, fixed_filter=fixed_filter, stride=2
+            ),
+            torch.nn.Conv1d(4, 8, 3, padding=2, padding_mode="reflect"),
+        ]
+    ).double()
+    waveform = torch.randn(2, 4, 37, dtype=torch.float64)
+    expected = [module(waveform) for module in convolutions]
+    parameters = dict(convolutions.named_parameters())
+    state_keys = tuple(convolutions.state_dict())
+    module_types = [type(module) for module in convolutions]
+    adapt_audio_vae_convolutions(convolutions)
+    for module, reference in zip(convolutions, expected, strict=True):
+        torch.testing.assert_close(module(waveform), reference, rtol=1e-12, atol=1e-12)
+    assert tuple(convolutions.state_dict()) == state_keys
+    assert [type(module) for module in convolutions] == module_types
+    assert all(
+        parameter is parameters[name]
+        for name, parameter in convolutions.named_parameters()
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_size, ratio", [(1, 2), (2, 2), (3, 2), (11, 2), (17, 3)]
+)
+@pytest.mark.parametrize("samples", [1, 37])
+@pytest.mark.parametrize("fixed_filter", [False, True])
+def test_causal_upsampling_preserves_transpose_convolution_crop(
+    kernel_size: int, ratio: int, samples: int, fixed_filter: bool
+) -> None:
+    module = UpSample1d(
+        channels=4,
+        causal=True,
+        fixed_filter=fixed_filter,
+        ratio=ratio,
+        kernel_size=kernel_size,
+    ).double()
+    generator = torch.Generator().manual_seed(23)
+    with torch.no_grad():
+        module.filter.copy_(torch.randn(module.filter.shape, generator=generator))
+    waveform = torch.randn(2, 4, samples, dtype=torch.float64, generator=generator)
+    expected = ratio * F.conv_transpose1d(
+        waveform, module.filter.expand(4, -1, -1), stride=ratio, groups=4
+    )
+    expected = expected[..., : -(kernel_size - ratio)]
+    adapt_audio_vae_convolutions(module)
+    torch.testing.assert_close(module(waveform), expected, rtol=1e-12, atol=1e-12)
 
 
 class FakeInference:
@@ -226,3 +300,54 @@ class TestVocoderFactorySignature:
             stage_name="vocoder",
         )
         assert out == {"stream_slots": 8, "enable_streaming_audio_vae_cuda_graph": True}
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+def test_decoder_precision_adapter_casts_input_and_preserves_checkpoint(
+    input_dtype: torch.dtype,
+) -> None:
+    decoder = torch.nn.Conv1d(4, 2, 3).half().eval()
+    latent_frames = torch.randn(2, 4, 12).to(dtype=input_dtype)
+    expected = decoder(latent_frames.half()).float()
+    state_keys = tuple(decoder.state_dict())
+    decoder.forward = MethodType(decoder_forward, decoder)
+    actual = decoder(latent_frames)
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+    assert type(decoder) is torch.nn.Conv1d
+    assert tuple(decoder.state_dict()) == state_keys
+
+
+class DecoderPrecisionCodec:
+    def __init__(self, checkpoint: str, *, device: str) -> None:
+        self.checkpoint: str = checkpoint
+        self.device: torch.device = torch.device(device)
+        self.vocoder: SimpleNamespace = SimpleNamespace(
+            decoder=torch.nn.Conv1d(4, 2, 3),
+            post_proj=torch.nn.Conv1d(4, 4, 1),
+        )
+
+
+def test_codec_cache_keeps_decoder_precisions_independent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codec_module, "resolve_checkpoint", str)
+    monkeypatch.setattr(codec_module, "DotsAudioCodec", DecoderPrecisionCodec)
+    monkeypatch.setattr(codec_module, "_CODEC_CACHE", {})
+    reference = codec_module.load_dots_audio_codec(str(tmp_path), device="cpu")
+    candidate = codec_module.load_dots_audio_codec(
+        str(tmp_path), device="cpu", decoder_dtype=torch.float16
+    )
+    assert reference is not candidate
+    assert reference.vocoder.decoder.weight.dtype == torch.float32
+    assert candidate.vocoder.decoder.weight.dtype == torch.float16
+    assert candidate.vocoder.post_proj.weight.dtype == torch.float32
+    assert codec_module.load_dots_audio_codec(str(tmp_path), device="cpu") is reference
+    assert (
+        codec_module.load_dots_audio_codec(
+            str(tmp_path), device="cpu", decoder_dtype=torch.float16
+        )
+        is candidate
+    )
+    output = candidate.vocoder.decoder(torch.randn(1, 4, 12))
+    assert output.dtype == torch.float32

@@ -10,13 +10,52 @@ import pytest
 import torch
 
 from sglang_omni.models.dots_tts.flow_head import DotsTTSFlowHead
-from tests.unit_test.fixtures.accelerator import require_device_streams
+from sglang_omni.platforms import current_platform
 
 LLM_HIDDEN = 48
 FM_HIDDEN = 32
 LATENT_DIM = 6
 PATCH_SIZE = 2
 NFE = 2
+
+
+def require_flow_device() -> torch.device:
+    device_type = current_platform.device_type
+    if device_type not in {"cuda", "musa", "npu", "xpu"}:
+        pytest.skip(f"{device_type} is not an accelerator")
+    else:
+        pass
+    device_module = torch.get_device_module(device_type)
+    if not device_module.is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    else:
+        return torch.device(device_type, device_module.current_device())
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_eos_staging_waits_for_device_flags(tmp_path: Path, device_type: str) -> None:
+    if current_platform.device_type != device_type:
+        pytest.skip(
+            f"requires {device_type}; this host uses {current_platform.device_type}"
+        )
+    else:
+        pass
+    device_module = torch.get_device_module(device_type)
+    if not device_module.is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    else:
+        pass
+    device = torch.device(device_type, device_module.current_device())
+    flow = flow_head(tmp_path).to(device)
+    flow.prepare_batched_eos_staging(2, device)
+    assert flow.batched_eos_pinned.is_pinned()
+    for flags in ([False, True], [True, False, True], [False]):
+        flow.stage_batched_eos(torch.tensor(flags, device=device))
+        assert flow.has_pending_batched_eos
+        assert flow.batched_eos_host is None
+        assert flow.resolve_batched_eos() == flags
+        assert not flow.has_pending_batched_eos
 
 
 def flow_head(tmp_path) -> DotsTTSFlowHead:
@@ -128,7 +167,7 @@ def test_single_stream_seed_survives_rematerialization(tmp_path: Path) -> None:
 def test_single_stream_seed_survives_accelerator_rematerialization(
     tmp_path: Path,
 ) -> None:
-    device = require_device_streams()
+    device = require_flow_device()
     assert_single_stream_seed_survives_rematerialization(
         tmp_path, device=device, dtype=torch.bfloat16
     )
@@ -671,7 +710,7 @@ def test_batched_replay_feedback_does_not_count_a_tail_step(tmp_path) -> None:
 def test_rotary_angles_stay_fp32_under_accelerator_autocast(
     tmp_path: Path,
 ) -> None:
-    device = require_device_streams()
+    device = require_flow_device()
     flow = flow_head(tmp_path).to(device=device, dtype=torch.bfloat16)
     rotary = flow.velocity_field_predictor.blocks[0].attn.rotary
     positions = torch.tensor(

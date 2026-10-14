@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -15,12 +16,16 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.models.dots_tts.vocoder_cuda_graph import (
+    ReplayableGraph,
+    capture_device_graph,
+)
 
 import_dots_tts()
 
 from dots_tts.modules.backbone.dit_inference import FusedAdaLNDiT
 from dots_tts.modules.backbone.inference_utils import fuse_qkv_projection
-from dots_tts.modules.backbone.layers import rotate_half
+from dots_tts.modules.backbone.layers import RotaryEmbedding, rotate_half
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +33,46 @@ _TAIL_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 _GRAPH_BATCH_BUCKETS = (8, 16)
 _GRAPH_CONTEXT_PATCH_BUCKETS = (16, 32, 64, 128)
 _TAIL_STEP_LOG_INTERVAL = 50
+
+
+def rms_normalization_forward(
+    module: nn.RMSNorm, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    assert module.weight is not None
+    # note (codex): Torch's composite RMSNorm uses FP32 opmath epsilon for BF16.
+    epsilon = torch.finfo(torch.float32).eps if module.eps is None else module.eps
+    return torch.ops.npu.npu_rms_norm(hidden_states, module.weight, epsilon)[0]
+
+
+def adapt_npu_rms_normalization(module: nn.Module) -> int:
+    normalization_count = 0
+    for layer in module.modules():
+        if (
+            type(layer) is nn.RMSNorm
+            and len(layer.normalized_shape) == 1
+            and layer.weight is not None
+            and layer.weight.device.type == "npu"
+            and layer.weight.dtype in {torch.float32, torch.bfloat16}
+        ):
+            layer.forward = MethodType(rms_normalization_forward, layer)
+            normalization_count += 1
+        else:
+            pass
+    return normalization_count
+
+
+def attention_context(device: torch.device) -> AbstractContextManager[None]:
+    """Keep the CUDA SDPA policy local to CUDA execution."""
+    if device.type == "cuda":
+        return sdpa_kernel(_TAIL_SDPA_BACKENDS)
+    else:
+        return nullcontext()
+
+
+def rotary_angles(rotary: RotaryEmbedding, positions: torch.Tensor) -> torch.Tensor:
+    """Keep rotary positions in float32 on every accelerator."""
+    with torch.autocast(device_type=positions.device.type, enabled=False):
+        return rotary(positions)
 
 
 def project_attention(
@@ -139,18 +184,30 @@ class SemanticEncoderDecodeStep(nn.Module):
         attn_mask: torch.Tensor,
         rotary_cos: torch.Tensor,
         rotary_sin: torch.Tensor,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         encoder = self.encoder
         raw = latent_patch.transpose(1, 2)
         projection = encoder.ds_proj
-        value = F.conv1d(
-            torch.cat([conv_tail, raw], dim=-1),
-            projection.weight,
-            projection.bias,
-            stride=projection.stride[0],
-            dilation=projection.dilation[0],
-            groups=projection.groups,
-        ).transpose(1, 2)
+        latent_frames = torch.cat([conv_tail, raw], dim=-1)
+        if latent_patch.device.type == "npu":
+            assert projection.dilation == (1,) and projection.groups == 1
+            # note (codex): Windowed GEMM avoids the uncapturable aclop convolution path.
+            latent_windows = latent_frames.unfold(
+                -1, projection.weight.shape[-1], projection.stride[0]
+            )
+            encoder_inputs = latent_windows.permute(0, 2, 1, 3).flatten(2)
+            value = F.linear(
+                encoder_inputs, projection.weight.flatten(1), projection.bias
+            )
+        else:
+            value = F.conv1d(
+                latent_frames,
+                projection.weight,
+                projection.bias,
+                stride=projection.stride[0],
+                dilation=projection.dilation[0],
+                groups=projection.groups,
+            ).transpose(1, 2)
         value = encoder.in_proj(value)
         keys, values = kv_buffer
         for layer_index, layer in enumerate(encoder.encoder.layers):
@@ -367,7 +424,7 @@ def validate_acoustic_pool_memory(
 
 @dataclass
 class CapturedTailGraph:
-    graph: torch.cuda.CUDAGraph
+    graph: ReplayableGraph
     inputs: dict[str, torch.Tensor]
     output: torch.Tensor
 
@@ -397,12 +454,12 @@ def batched_causal_update_mask(
 
 
 def rotary_cos_sin(
-    rotary: Callable[[torch.Tensor], torch.Tensor], starts: torch.Tensor, length: int
+    rotary: RotaryEmbedding, starts: torch.Tensor, length: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-slot-start form of
     ``dots_tts.modules.backbone.inference_utils.build_rotary_cos_sin``."""
     offsets = torch.arange(length, device=starts.device, dtype=torch.float32)
-    embedding = rotary(starts.reshape(-1, 1).float() + offsets)
+    embedding = rotary_angles(rotary, starts.reshape(-1, 1).float() + offsets)
     return embedding.cos(), embedding.sin()
 
 
@@ -428,6 +485,12 @@ class DotsTtsAcousticTail:
         self.coordinate_proj = coordinate_proj
         self.latent_proj = latent_proj
         self.encoder = patch_encoder
+        if optimize and device.type == "npu":
+            normalization_count = adapt_npu_rms_normalization(dit)
+            normalization_count += adapt_npu_rms_normalization(patch_encoder)
+            logger.info(f"dots.tts NPU fused RMSNorm modules={normalization_count}")
+        else:
+            pass
         for layer in patch_encoder.encoder.layers:
             fuse_qkv_projection(layer.attn)
         self.encoder_step = SemanticEncoderDecodeStep(patch_encoder).eval()
@@ -460,13 +523,13 @@ class DotsTtsAcousticTail:
         self.meanflow_graphs: dict[tuple[int, int], CapturedTailGraph] = {}
         self.encoder_graphs: dict[tuple[int, int], CapturedTailGraph] = {}
         self.graph_pool: tuple[int, int] | None = None
-        self.capture_stream: torch.cuda.Stream | None = None
+        self.capture_stream: torch.Stream | None = None
         self.graph_replays: Counter[str] = Counter()
         self.graph_misses: Counter[str] = Counter()
         self.tail_steps = 0
         self.dit_contiguous_view_steps = 0
-        if optimize and device.type == "cuda":
-            self.capture_cuda_graphs()
+        if optimize and device.type in {"cuda", "npu"}:
+            self.capture_device_graphs()
         else:
             pass
 
@@ -734,11 +797,11 @@ class DotsTtsAcousticTail:
             positions = torch.arange(
                 tokens, device=value.device, dtype=torch.float32
             ).reshape(1, tokens)
-            embedding = self.encoder_rotary(positions)
+            embedding = rotary_angles(self.encoder_rotary, positions)
             rotary = embedding.cos(), embedding.sin()
         else:
             pass
-        with sdpa_kernel(_TAIL_SDPA_BACKENDS):
+        with attention_context(self.device):
             for layer_index, layer in enumerate(encoder.encoder.layers):
                 output, key, item = project_attention(
                     layer.attn,
@@ -790,9 +853,9 @@ class DotsTtsAcousticTail:
         positions = torch.arange(
             persistent, device=fm_rows.device, dtype=torch.float32
         ).reshape(1, persistent)
-        rotary = self.dit_rotary(positions)
+        rotary = rotary_angles(self.dit_rotary, positions)
         prefix = fm_rows[:persistent].unsqueeze(0)
-        with sdpa_kernel(_TAIL_SDPA_BACKENDS):
+        with attention_context(self.device):
             for ode_index in range(spec.nfe):
                 keys: list[torch.Tensor] = []
                 values: list[torch.Tensor] = []
@@ -825,6 +888,14 @@ class DotsTtsAcousticTail:
                     torch.stack(values)[:, 0]
                 )
 
+    def device_indices(self, indices: list[int]) -> torch.Tensor:
+        if self.device.type == "npu":
+            return torch.tensor(
+                indices, device="cpu", dtype=torch.long, pin_memory=True
+            ).to(self.device, non_blocking=True)
+        else:
+            return torch.tensor(indices, device=self.device, dtype=torch.long)
+
     @torch.no_grad()
     def sample_patches(
         self,
@@ -833,7 +904,7 @@ class DotsTtsAcousticTail:
         fm_hidden_rows: torch.Tensor,
     ) -> torch.Tensor:
         spec = self.spec
-        slot_index = torch.tensor(slots, device=self.device, dtype=torch.long)
+        slot_index = self.device_indices(slots)
         for slot in slots:
             self._fm_seq_len[
                 slot
@@ -852,9 +923,7 @@ class DotsTtsAcousticTail:
             raise RuntimeError("dots.tts flow history exceeded the DiT cache")
         else:
             pass
-        persistent_index = torch.tensor(
-            persistent, device=self.device, dtype=torch.long
-        )
+        persistent_index = self.device_indices(persistent)
         noise = self.sample_noise(slots)
         direct_kv = len(slots) == spec.num_slots and sorted(slots) == list(
             range(spec.num_slots)
@@ -895,7 +964,9 @@ class DotsTtsAcousticTail:
             latent = graph.output.clone()
             self.graph_replays["meanflow"] += 1
             if self.graph_replays["meanflow"] == 1:
-                logger.info("dots.tts batched MeanFlow CUDA graph replay is active")
+                logger.info(
+                    f"dots.tts batched MeanFlow {self.device.type} graph replay is active"
+                )
             else:
                 pass
         if direct_kv:
@@ -980,7 +1051,7 @@ class DotsTtsAcousticTail:
         layer_index = self.dit_layer_index.reshape(self.dit_layers, 1, 1)
         batch_index = slot_index.reshape(1, rows, 1)
         promote = slice(capacity, capacity + unit)
-        with sdpa_kernel(_TAIL_SDPA_BACKENDS):
+        with attention_context(self.device):
             for ode_index in range(spec.nfe):
                 if direct_kv:
                     keys = self.dit_k[ode_index, :, :rows, :, : capacity + query_len]
@@ -1080,7 +1151,7 @@ class DotsTtsAcousticTail:
     def encode_feedback(
         self, slots: list[int], latent_patches: torch.Tensor
     ) -> torch.Tensor:
-        slot_index = torch.tensor(slots, device=self.device, dtype=torch.long)
+        slot_index = self.device_indices(slots)
         rows = len(slots)
         block = self.encoder_block
         starts = [self.encoder_seq_len[slot] for slot in slots]
@@ -1089,7 +1160,7 @@ class DotsTtsAcousticTail:
             raise RuntimeError("dots.tts patch-encoder cache overflow")
         else:
             pass
-        start_index = torch.tensor(starts, device=self.device, dtype=torch.long)
+        start_index = self.device_indices(starts)
         graph = self.select_graph(self.encoder_graphs, rows, capacity)
         if graph is None:
             self.graph_misses["semantic_encoder"] += 1
@@ -1108,7 +1179,7 @@ class DotsTtsAcousticTail:
             self.graph_replays["semantic_encoder"] += 1
             if self.graph_replays["semantic_encoder"] == 1:
                 logger.info(
-                    "dots.tts batched semantic-encoder CUDA graph replay is active"
+                    f"dots.tts batched semantic-encoder {self.device.type} graph replay is active"
                 )
             else:
                 pass
@@ -1145,7 +1216,7 @@ class DotsTtsAcousticTail:
             slot_index,
             out=values[:, :, :, :capacity],
         )
-        with sdpa_kernel(_TAIL_SDPA_BACKENDS):
+        with attention_context(self.device):
             embeddings, conv_tail = self.encoder_step(
                 latent_patches.to(self.dtype),
                 self.encoder_conv_tail.index_select(0, slot_index),
@@ -1187,10 +1258,13 @@ class DotsTtsAcousticTail:
         return None if bucket is None else graphs[(rows, bucket)]
 
     @torch.no_grad()
-    def capture_cuda_graphs(self) -> None:
-        batch_buckets = tuple(
-            batch for batch in _GRAPH_BATCH_BUCKETS if batch <= self.spec.num_slots
-        )
+    def capture_device_graphs(self) -> None:
+        if self.device.type == "npu":
+            batch_buckets = tuple(range(1, self.spec.num_slots + 1))
+        else:
+            batch_buckets = tuple(
+                batch for batch in _GRAPH_BATCH_BUCKETS if batch <= self.spec.num_slots
+            )
         context_buckets = tuple(
             patches
             for patches in _GRAPH_CONTEXT_PATCH_BUCKETS
@@ -1201,11 +1275,12 @@ class DotsTtsAcousticTail:
         else:
             pass
 
-        current_stream = torch.cuda.current_stream(self.device)
-        self.capture_stream = torch.cuda.Stream(device=self.device)
+        device_module = torch.get_device_module(self.device)
+        current_stream = device_module.current_stream(self.device)
+        self.capture_stream = device_module.Stream(device=self.device)
         self.capture_stream.wait_stream(current_stream)
-        self.graph_pool = torch.cuda.graph_pool_handle()
-        with torch.cuda.stream(self.capture_stream):
+        self.graph_pool = device_module.graph_pool_handle()
+        with device_module.stream(self.capture_stream):
             for batch_size in reversed(batch_buckets):
                 for patches in reversed(context_buckets):
                     self.capture_graph(
@@ -1221,14 +1296,11 @@ class DotsTtsAcousticTail:
                         kind="semantic_encoder",
                     )
         current_stream.wait_stream(self.capture_stream)
-        torch.cuda.synchronize(self.device)
+        device_module.synchronize(self.device)
         logger.info(
-            "dots.tts acoustic-tail CUDA graphs: meanflow=%d semantic_encoder=%d "
-            "batch_buckets=%s context_patch_buckets=%s",
-            len(self.meanflow_graphs),
-            len(self.encoder_graphs),
-            batch_buckets,
-            context_buckets,
+            f"dots.tts acoustic-tail {self.device.type} graphs: "
+            f"meanflow={len(self.meanflow_graphs)} semantic_encoder={len(self.encoder_graphs)} "
+            f"batch_buckets={batch_buckets} context_patch_buckets={context_buckets}"
         )
 
     def capture_graph(
@@ -1289,35 +1361,34 @@ class DotsTtsAcousticTail:
                 inputs["latent"],
             )
 
-        graph = torch.cuda.CUDAGraph()
+        assert self.graph_pool is not None and self.capture_stream is not None
+        graph: ReplayableGraph | None = None
         try:
             for _ in range(2):
                 run()
             self.capture_stream.synchronize()
-            with torch.cuda.graph(
-                graph,
-                pool=self.graph_pool,
-                stream=self.capture_stream,
-                capture_error_mode="thread_local",
-            ):
+            with capture_device_graph(
+                device=self.device,
+                graph_pool=self.graph_pool,
+                capture_stream=self.capture_stream,
+            ) as graph:
                 output = run()
             destination[key] = CapturedTailGraph(graph, inputs, output)
         except Exception as exc:
-            graph.reset()
+            if graph is not None:
+                graph.reset()
+            else:
+                pass
             logger.warning(
-                "dots.tts %s CUDA graph capture failed for batch=%d capacity=%d: "
-                "%s; using eager fallback",
-                kind,
-                batch_size,
-                capacity,
-                exc,
+                f"dots.tts {kind} {self.device.type} graph capture failed "
+                f"for batch={batch_size} capacity={capacity}: {exc}; using eager fallback"
             )
 
     @property
     def backend(self) -> str:
         if self.meanflow_graphs and self.encoder_graphs:
             return (
-                "CUDA graph batched tail with eager fallback "
+                f"{self.device.type} graph batched tail with eager fallback "
                 f"(meanflow={len(self.meanflow_graphs)}, "
                 f"semantic_encoder={len(self.encoder_graphs)})"
             )

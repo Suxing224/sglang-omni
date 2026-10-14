@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact-(B, T) CUDA graphs over the dots.tts slot-pool AudioVAE step."""
+"""Device graphs over the dots.tts slot-pool AudioVAE step."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
-from typing import NamedTuple
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
+from typing import NamedTuple, Protocol
 
 import torch
 
@@ -14,20 +15,65 @@ HIT_RATE_LOG_EVERY = 1024
 
 StepInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 StepOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-StepForward = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    StepOutputs,
-]
+
+
+class ReplayableGraph(Protocol):
+    def replay(self) -> None: ...
+
+    def reset(self) -> None: ...
+
+
+@contextmanager
+def capture_device_graph(
+    *, device: torch.device, graph_pool: tuple[int, int], capture_stream: torch.Stream
+) -> Iterator[ReplayableGraph]:
+    """Capture dots.tts without importing unrelated accelerator graph types."""
+    if device.type == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            cuda_graph=graph,
+            pool=graph_pool,
+            stream=capture_stream,
+            capture_error_mode="thread_local",
+        ):
+            yield graph
+    elif device.type == "npu":
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(
+            npu_graph=graph,
+            pool=graph_pool,
+            stream=capture_stream,
+            capture_error_mode="thread_local",
+        ):
+            yield graph
+    else:
+        raise RuntimeError(f"dots.tts has no graph backend for {device}")
+
+
+class StepForward(Protocol):
+    def __call__(
+        self,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        window: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> StepOutputs: ...
+
+
+class StepInputFactory(Protocol):
+    def __call__(self, batch_size: int, frames: int) -> StepInputs: ...
 
 
 class CapturedStepGraph(NamedTuple):
-    graph: torch.cuda.CUDAGraph
+    graph: ReplayableGraph
     packed: torch.Tensor
     hidden_h: torch.Tensor
     hidden_c: torch.Tensor
     window: torch.Tensor
     valid: torch.Tensor
     outputs: StepOutputs
+    capture_stream: torch.Stream
 
 
 class DotsVocoderGraphRunner:
@@ -42,7 +88,7 @@ class DotsVocoderGraphRunner:
         self,
         *,
         forward: StepForward,
-        new_inputs: Callable[[int, int], StepInputs],
+        new_inputs: StepInputFactory,
         device: torch.device,
         warmup_iters: int = 2,
     ) -> None:
@@ -60,38 +106,41 @@ class DotsVocoderGraphRunner:
 
     @torch.no_grad()
     def capture(self, keys: Iterable[tuple[int, int]]) -> None:
-        if self.device.type != "cuda":
-            raise RuntimeError("dots.tts vocoder CUDA graphs require a CUDA device")
+        if self.device.type not in {"cuda", "npu"}:
+            raise RuntimeError(
+                f"dots.tts vocoder has no graph backend for {self.device}"
+            )
         else:
             pass
         # note (lennox): capture largest first so smaller graphs reuse freed blocks.
         ordered = sorted(
             {(int(b), int(t)) for b, t in keys} - set(self.graphs), reverse=True
         )
-        with torch.cuda.device(self.device):
-            current_stream = torch.cuda.current_stream(self.device)
-            capture_stream = torch.cuda.Stream(device=self.device)
+        device_module = torch.get_device_module(self.device)
+        with device_module.device(self.device):
+            current_stream = device_module.current_stream(self.device)
+            capture_stream = device_module.Stream(device=self.device)
             capture_stream.wait_stream(current_stream)
-            graph_pool = torch.cuda.graph_pool_handle()
+            graph_pool = device_module.graph_pool_handle()
             for key in ordered:
                 inputs = self.new_inputs(*key)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.stream(capture_stream):
+                with device_module.stream(capture_stream):
                     for _ in range(self.warmup_iters):
                         self.forward(*inputs)
                 capture_stream.synchronize()
-                with torch.cuda.graph(
-                    graph,
-                    pool=graph_pool,
-                    stream=capture_stream,
-                    capture_error_mode="thread_local",
-                ):
+                with capture_device_graph(
+                    device=self.device,
+                    graph_pool=graph_pool,
+                    capture_stream=capture_stream,
+                ) as graph:
                     outputs = self.forward(*inputs)
-                self.graphs[key] = CapturedStepGraph(graph, *inputs, outputs)
+                self.graphs[key] = CapturedStepGraph(
+                    graph, *inputs, outputs, capture_stream
+                )
             current_stream.wait_stream(capture_stream)
-            torch.cuda.synchronize(self.device)
+            device_module.synchronize(self.device)
         logger.info(
-            f"dots.tts streaming vocoder CUDA graphs captured: {self.captured_keys}"
+            f"dots.tts streaming vocoder {self.device.type} graphs captured: {self.captured_keys}"
         )
 
     @torch.no_grad()
@@ -108,22 +157,39 @@ class DotsVocoderGraphRunner:
             self.misses += 1
             outputs = None
         else:
-            captured.packed.copy_(packed)
-            captured.hidden_h.copy_(hidden_h)
-            captured.hidden_c.copy_(hidden_c)
-            captured.window.copy_(window)
-            captured.valid.copy_(valid)
-            captured.graph.replay()
-            self.replays += 1
-            outputs = tuple(output.clone() for output in captured.outputs)
+            device_module = torch.get_device_module(self.device)
+            current_stream = device_module.current_stream(self.device)
+            if self.device.type == "npu":
+                # note (codex): Keep NPU graph outputs ordered with their capture stream.
+                captured.capture_stream.wait_stream(current_stream)
+                for tensor in (packed, hidden_h, hidden_c, window, valid):
+                    tensor.record_stream(captured.capture_stream)
+                execution_context = device_module.stream(captured.capture_stream)
+            else:
+                execution_context = nullcontext()
+            with execution_context:
+                captured.packed.copy_(packed)
+                captured.hidden_h.copy_(hidden_h)
+                captured.hidden_c.copy_(hidden_c)
+                captured.window.copy_(window)
+                captured.valid.copy_(valid)
+                captured.graph.replay()
+                self.replays += 1
+                outputs = tuple(output.clone() for output in captured.outputs)
+            if self.device.type == "npu":
+                current_stream.wait_stream(captured.capture_stream)
+                for tensor in outputs:
+                    tensor.record_stream(current_stream)
+            else:
+                pass
         calls = self.replays + self.misses
         milestone = calls == 1 or calls % HIT_RATE_LOG_EVERY == 0
         logger.log(
             logging.INFO if milestone else logging.DEBUG,
-            f"dots.tts streaming vocoder CUDA graph replays={self.replays} "
+            f"dots.tts streaming vocoder {self.device.type} graph replays={self.replays} "
             f"misses={self.misses} ({100.0 * self.replays / calls:.1f}% hit)",
         )
         return outputs
 
 
-__all__ = ["DotsVocoderGraphRunner"]
+__all__ = ["DotsVocoderGraphRunner", "ReplayableGraph", "capture_device_graph"]

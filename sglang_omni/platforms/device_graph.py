@@ -15,7 +15,8 @@ from typing import Literal, Protocol, TypedDict
 
 import torch
 from torch.cuda import _POOL_HANDLE as CudaGraphPoolHandle
-from torch.xpu import _POOL_HANDLE as XpuGraphPoolHandle
+
+XpuGraphPoolHandle = tuple[int, int]
 
 
 class CudaCaptureKwargs(TypedDict, total=False):

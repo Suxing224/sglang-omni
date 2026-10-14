@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -173,3 +174,69 @@ def test_dots_direct_preprocessor_resolves_tokenizer_invariants(
     assert tokenizer.converted_tokens == tokenizer.audio_span_tokens
     assert state.audio_span_token_ids == [102, 103]
     assert state.vocab_size == 256
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize(
+    ("speech_text", "reference_text"),
+    [
+        (
+            "You aren’t positive, you’re negative.",
+            "That's 50 people in Zürich 中文“测试”.",
+        ),
+        (
+            "You aren't positive, you're negative.",
+            "That’s 50 people in Zürich 中文“测试”.",
+        ),
+        (
+            "You aren‘t positive, you‘re negative.",
+            "That‘s 50 people in Zürich 中文“测试”.",
+        ),
+        (
+            "You aren't positive, you're negative.",
+            "That's 50 people in Zürich 中文“测试”.",
+        ),
+    ],
+)
+def test_contraction_typography_preserves_spoken_text_and_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    speech_text: str,
+    reference_text: str,
+    normalize: bool,
+) -> None:
+    normalization_inputs: list[str] = []
+
+    def record_normalization(text: str) -> str:
+        normalization_inputs.append(text)
+        return text
+
+    monkeypatch.setattr("dots_tts.utils.text.normalize_text", record_normalization)
+    audio_path = "data:audio/wav;base64,UklGRg=="
+    payload = make_payload(
+        tts_params={"normalize_text": normalize},
+        references=[{"audio_path": audio_path, "text": reference_text}],
+    )
+    payload.request.inputs["input"] = speech_text
+    original_inputs = deepcopy(payload.request.inputs)
+    tokenizer = RecordingTokenizer()
+    state = run_preprocess(payload, tokenizer)
+
+    canonical_text = "You aren't positive, you're negative."
+    canonical_reference = "That's 50 people in Zürich 中文“测试”."
+    canonical_payload = make_payload(
+        tts_params={"normalize_text": normalize},
+        references=[{"audio_path": audio_path, "text": canonical_reference}],
+    )
+    canonical_payload.request.inputs["input"] = canonical_text
+    canonical_tokenizer = RecordingTokenizer()
+    run_preprocess(canonical_payload, canonical_tokenizer)
+
+    assert tokenizer.encoded_text == canonical_tokenizer.encoded_text
+    assert any(canonical_text in text for text in tokenizer.encoded_text)
+    assert any(canonical_reference in text for text in tokenizer.encoded_text)
+    assert normalization_inputs == (
+        [canonical_text, canonical_text] if normalize else []
+    )
+    assert payload.request.inputs == original_inputs
+    assert state.prompt_audio_path == audio_path
+    assert state.use_prompt_prefill is True

@@ -359,3 +359,52 @@ def test_decode_delta_non_final_is_a_no_op() -> None:
     assert state.pending
     assert state.slot is not None
     assert not pool.steps
+
+
+class LatentWaveformInference(FakeInference):
+    def _decode_stream_window(
+        self, window: torch.Tensor
+    ) -> torch.Tensor:  # noqa: leading-underscore  # AudioVAE interface
+        return window.sum(dim=1, keepdim=True).repeat_interleave(self.hop_size, dim=-1)
+
+
+@pytest.mark.parametrize("valid_frame_counts", [(0, 0), (0, 3), (3, 3)])
+def test_prefix_decoder_preserves_full_state_and_stable_audio(
+    valid_frame_counts: tuple[int, int],
+) -> None:
+    inference = LatentWaveformInference()
+    pool = DotsVocoderSlotPool(inference, num_slots=2, chunk_size=12, latent_dim=5)
+    generator = torch.Generator().manual_seed(42)
+    packed = torch.randn(2, 5, 3, generator=generator)
+    hidden = torch.randn(1, 2, 8, generator=generator)
+    window = torch.zeros(2, 5, pool.window_size)
+    for row, valid_frames in enumerate(valid_frame_counts):
+        window[row, :, :valid_frames] = torch.randn(
+            5, valid_frames, generator=generator
+        )
+    valid = torch.tensor(valid_frame_counts, dtype=torch.int64)
+    expected_audio, *expected_states = pool.forward(
+        packed, hidden, hidden.clone(), window, valid
+    )
+    prefix_frames = max(valid_frame_counts) + packed.shape[-1]
+    actual_audio, *actual_states = pool.forward(
+        packed,
+        hidden,
+        hidden.clone(),
+        window,
+        valid,
+        decoder_window_frames=prefix_frames,
+    )
+    for actual_state, expected_state in zip(
+        actual_states, expected_states, strict=True
+    ):
+        torch.testing.assert_close(actual_state, expected_state)
+    for row, valid_frames in enumerate(valid_frame_counts):
+        stable_samples = (
+            valid_frames + packed.shape[-1] - pool.lookahead
+        ) * pool.hop_size
+        torch.testing.assert_close(
+            actual_audio[row, ..., :stable_samples],
+            expected_audio[row, ..., :stable_samples],
+        )
+    assert actual_states[-1].shape == window.shape

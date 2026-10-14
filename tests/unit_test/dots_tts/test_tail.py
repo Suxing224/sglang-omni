@@ -7,7 +7,7 @@ import logging
 from collections import Counter
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from dots_tts.modules.backbone.dit import DiT
 from dots_tts.modules.backbone.encoder import VAESemanticEncoder
 
 from sglang_omni.models.dots_tts import tail
+from sglang_omni.platforms import current_platform
 
 FM_HIDDEN = 32
 LATENT_DIM = 6
@@ -54,8 +55,11 @@ def test_batched_tail_mask_hides_padding_and_preserves_causality() -> None:
 
 
 class TailModel(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self, normalization: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
+    ) -> None:
         super().__init__()
+        self.normalization = normalization
         self.velocity_field_predictor = DiT(
             in_dim=FM_HIDDEN,
             out_dim=LATENT_DIM,
@@ -66,6 +70,7 @@ class TailModel(torch.nn.Module):
                 ffn_hidden_size=64,
                 modulation=True,
                 qk_norm=True,
+                norm_layer=normalization,
                 rotary_bias=True,
             ),
             mode="meanflow",
@@ -77,12 +82,15 @@ class TailModel(torch.nn.Module):
                 parameter.normal_(0.0, 0.2)
 
 
-def patch_encoder() -> VAESemanticEncoder:
+def patch_encoder(
+    normalization: Literal["LayerNorm", "RMSNorm"] = "LayerNorm",
+) -> VAESemanticEncoder:
     encoder_config = _EncoderConfig(
         num_layers=1,
         num_heads=2,
         hidden_size=FM_HIDDEN,
         ffn_hidden_size=64,
+        norm_layer=normalization,
         causal=True,
     )
     config = type(
@@ -102,7 +110,7 @@ def build_tail(
     patch_capacity: int = 8,
     optimize: bool = False,
 ):
-    encoder = patch_encoder().to(device=device, dtype=dtype)
+    encoder = patch_encoder(model.normalization).to(device=device, dtype=dtype)
     with torch.no_grad():
         for parameter in encoder.parameters():
             parameter.normal_(0.0, 0.2)
@@ -266,12 +274,15 @@ def test_validate_acoustic_pool_memory_rejects_when_vram_is_tight(
         dtype=torch.bfloat16,
     )
     device = torch.device("cuda:0")
-    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    device_module = SimpleNamespace(
+        device=lambda _device: nullcontext(),
+        empty_cache=lambda: None,
+        mem_get_info=lambda _device=None: (4 << 30, 80 << 30),
+    )
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
-        lambda _device=None: (4 << 30, 80 << 30),
+        torch,
+        "get_device_module",
+        lambda _device: device_module,
     )
     with pytest.raises(ValueError, match="admission failed at startup") as caught:
         tail.validate_acoustic_pool_memory(estimate, device=device)
@@ -282,7 +293,7 @@ def test_validate_acoustic_pool_memory_rejects_when_vram_is_tight(
 
     # Enough free memory passes.
     monkeypatch.setattr(
-        torch.cuda,
+        device_module,
         "mem_get_info",
         lambda _device=None: (40 << 30, 80 << 30),
     )
@@ -307,16 +318,15 @@ def test_validate_acoustic_pool_memory_releases_cached_blocks_before_sampling_fr
         dtype=torch.uint8,
     )
     memory = {"free": 10}
-    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
-    monkeypatch.setattr(
-        torch.cuda,
-        "empty_cache",
-        lambda: memory.update(free=12),
+    device_module = SimpleNamespace(
+        device=lambda _device: nullcontext(),
+        empty_cache=lambda: memory.update(free=12),
+        mem_get_info=lambda _device=None: (memory["free"], 20),
     )
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
-        lambda _device=None: (memory["free"], 20),
+        torch,
+        "get_device_module",
+        lambda _device: device_module,
     )
 
     tail.validate_acoustic_pool_memory(
@@ -385,12 +395,50 @@ def test_fused_dit_builds_modulations_with_bfloat16_weights() -> None:
     assert mods.dtype == torch.bfloat16
 
 
+def require_tail_device(device_type: str) -> torch.device:
+    if current_platform.device_type != device_type:
+        pytest.skip(
+            f"requires {device_type}; this host uses {current_platform.device_type}"
+        )
+    else:
+        pass
+    device_module = torch.get_device_module(device_type)
+    if not device_module.is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    else:
+        pass
+    return torch.device(device_type, device_module.current_device())
+
+
 @pytest.mark.accelerator
-def test_batched_tail_cuda_graph_matches_eager_for_dynamic_slot_order() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_feedback_matches_full_encoder_on_accelerator(device_type: str) -> None:
+    device = require_tail_device(device_type)
+    dtype = torch.bfloat16
     torch.manual_seed(1234)
-    device = torch.device("cuda")
+    model = TailModel().eval().to(device=device, dtype=dtype)
+    acoustic_tail = build_tail(model, slots=2, device=device, dtype=dtype)
+    reference_encoder = copy.deepcopy(acoustic_tail.encoder)
+    slot = acoustic_tail.acquire_slot()
+    latent_history: list[torch.Tensor] = []
+    with torch.no_grad():
+        for _ in range(3):
+            latent_patch = torch.randn(
+                1, PATCH_SIZE, LATENT_DIM, device=device, dtype=dtype
+            )
+            latent_history.append(latent_patch)
+            expected = reference_encoder(torch.cat(latent_history, dim=1))[:, -1]
+            actual = acoustic_tail.encode_feedback([slot], latent_patch)
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_batched_tail_graph_matches_eager_for_dynamic_slot_order(
+    device_type: str,
+) -> None:
+    device = require_tail_device(device_type)
+    torch.manual_seed(1234)
     dtype = torch.bfloat16
     eager_model = TailModel().eval().to(device=device, dtype=dtype)
     graph_model = copy.deepcopy(eager_model)
@@ -568,3 +616,187 @@ def test_validate_acoustic_pool_memory_gates_xpu_through_xpu_memory_only(
     memory["free"] = 40 << 30
     tail.validate_acoustic_pool_memory(estimate, device=device)
     assert memory["released"] == 2
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_npu_tail_graphs_cover_dynamic_batches_and_preserve_inactive_slots(
+    normalization: Literal["LayerNorm", "RMSNorm"],
+) -> None:
+    device = require_tail_device("npu")
+    dtype = torch.bfloat16
+    slot_count = 16
+    torch.manual_seed(1234)
+    eager_model = TailModel(normalization).eval().to(device=device, dtype=dtype)
+    graph_model = copy.deepcopy(eager_model)
+    torch.manual_seed(9)
+    eager = build_tail(
+        eager_model, slots=slot_count, device=device, dtype=dtype, patch_capacity=33
+    )
+    torch.manual_seed(9)
+    graph = build_tail(
+        graph_model,
+        slots=slot_count,
+        device=device,
+        dtype=dtype,
+        patch_capacity=33,
+        optimize=True,
+    )
+    pool_names = (
+        "dit_k",
+        "dit_v",
+        "encoder_k",
+        "encoder_v",
+        "encoder_conv_tail",
+        "window",
+        "all_mods",
+    )
+    for name in pool_names:
+        eager_pool = getattr(eager, name)
+        eager_pool.normal_(0, 0.05)
+        getattr(graph, name).copy_(eager_pool)
+    for slot in range(slot_count):
+        eager._fm_seq_len[slot] = graph._fm_seq_len[slot] = (
+            40  # noqa: leading-underscore  # Model state contract
+        )
+        eager.encoder_seq_len[slot] = graph.encoder_seq_len[slot] = 12
+        eager.initialize_slot_rng(slot, 100 + slot)
+        graph.initialize_slot_rng(slot, 100 + slot)
+    batch_sizes = [size for pair in zip(range(16, 8, -1), range(1, 9)) for size in pair]
+    slot_dimensions = {
+        "dit_k": 2,
+        "dit_v": 2,
+        "encoder_k": 1,
+        "encoder_v": 1,
+        "encoder_conv_tail": 0,
+        "window": 0,
+        "all_mods": 1,
+    }
+    device_module = torch.get_device_module(device)
+    current_stream = device_module.current_stream(device)
+    replay_stream = device_module.Stream(device=device)
+    replay_stream.wait_stream(current_stream)
+    with device_module.stream(replay_stream):
+        for step_index, batch_size in enumerate(batch_sizes, start=1):
+            slots = torch.randperm(slot_count)[:batch_size].tolist()
+            inactive_slots = torch.tensor(
+                [slot for slot in range(slot_count) if slot not in slots],
+                device=device,
+                dtype=torch.long,
+            )
+            inactive_states = {
+                name: getattr(graph, name)
+                .index_select(slot_dimensions[name], inactive_slots)
+                .clone()
+                for name in pool_names
+            }
+            hidden = torch.randn(batch_size, FM_HIDDEN, device=device, dtype=dtype)
+            eager_latent = eager.sample_patches(slots, fm_hidden_rows=hidden)
+            graph_latent = graph.sample_patches(slots, fm_hidden_rows=hidden)
+            torch.testing.assert_close(graph_latent, eager_latent, rtol=2e-2, atol=2e-2)
+            latent = torch.randn(
+                batch_size, PATCH_SIZE, LATENT_DIM, device=device, dtype=dtype
+            )
+            eager_feedback = eager.encode_feedback(slots, latent)
+            graph_feedback = graph.encode_feedback(slots, latent)
+            torch.testing.assert_close(
+                graph_feedback, eager_feedback, rtol=2e-2, atol=2e-2
+            )
+            for slot in range(slot_count):
+                assert graph.fm_seq_len(slot) == eager.fm_seq_len(slot)
+                assert graph.encoder_seq_len[slot] == eager.encoder_seq_len[slot]
+                persistent_frames = graph.fm_seq_len(slot) - graph.spec.unit_len
+                encoder_frames = graph.encoder_seq_len[slot]
+                assert 0 <= persistent_frames <= graph.dit_k.shape[-2]
+                assert 0 <= encoder_frames <= graph.encoder_k.shape[-2]
+                for name in ("dit_k", "dit_v"):
+                    torch.testing.assert_close(
+                        getattr(graph, name)[:, :, slot, :, :persistent_frames],
+                        getattr(eager, name)[:, :, slot, :, :persistent_frames],
+                        rtol=2e-2,
+                        atol=2e-2,
+                    )
+                for name in ("encoder_k", "encoder_v"):
+                    torch.testing.assert_close(
+                        getattr(graph, name)[:, slot, :, :encoder_frames],
+                        getattr(eager, name)[:, slot, :, :encoder_frames],
+                        rtol=2e-2,
+                        atol=2e-2,
+                    )
+            for name in ("encoder_conv_tail", "window", "all_mods"):
+                torch.testing.assert_close(
+                    getattr(graph, name), getattr(eager, name), rtol=2e-2, atol=2e-2
+                )
+            for name, original_state in inactive_states.items():
+                torch.testing.assert_close(
+                    getattr(graph, name).index_select(
+                        slot_dimensions[name], inactive_slots
+                    ),
+                    original_state,
+                    rtol=0,
+                    atol=0,
+                )
+            assert graph.graph_replays["meanflow"] == step_index
+            assert graph.graph_replays["semantic_encoder"] == step_index
+            assert not graph.graph_misses
+    current_stream.wait_stream(replay_stream)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("epsilon", [None, 1e-6])
+def test_npu_rms_normalization_preserves_strided_inputs_and_module_state(
+    dtype: torch.dtype, epsilon: float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = require_tail_device("npu")
+    torch.manual_seed(42)
+    normalization = torch.nn.RMSNorm(64, eps=epsilon, device=device, dtype=dtype)
+    with torch.no_grad():
+        normalization.weight.normal_(1.0, 0.2)
+    unsupported = torch.nn.RMSNorm((4, 64), device=device, dtype=dtype)
+    unaffined = torch.nn.RMSNorm(64, elementwise_affine=False, device=device)
+    modules = torch.nn.ModuleList([normalization, unsupported, unaffined])
+    parameters_before = tuple(modules.parameters())
+    state_before = {name: value.clone() for name, value in modules.state_dict().items()}
+    query = torch.randn(4, 10, 3, 8, 64, device=device, dtype=dtype).permute(
+        2, 0, 3, 1, 4
+    )[0]
+    assert not query.is_contiguous()
+    inputs = [query] + [query * scale for scale in (0.0, 1e-5, 1.0, 1e5)]
+    fused_epsilon_calls: list[float] = []
+    fused_kernel = torch.ops.npu.npu_rms_norm
+
+    def record_fused_normalization(
+        hidden_states: torch.Tensor, weight: torch.Tensor, kernel_epsilon: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fused_epsilon_calls.append(kernel_epsilon)
+        return fused_kernel(hidden_states, weight, kernel_epsilon)
+
+    monkeypatch.setattr(torch.ops.npu, "npu_rms_norm", record_fused_normalization)
+    with torch.inference_mode():
+        expected = [normalization(value) for value in inputs]
+        normalization_count = tail.adapt_npu_rms_normalization(modules)
+        assert normalization_count == 1
+        assert normalization.forward.__func__ is tail.rms_normalization_forward
+        for value, reference in zip(inputs, expected, strict=True):
+            actual = normalization(value)
+            assert actual.dtype == reference.dtype
+            assert bool(torch.isfinite(actual).all())
+            torch.testing.assert_close(
+                actual,
+                reference,
+                rtol=2e-2 if dtype == torch.bfloat16 else 1e-5,
+                atol=2e-2 if dtype == torch.bfloat16 else 1e-6,
+            )
+    effective_epsilon = torch.finfo(torch.float32).eps if epsilon is None else epsilon
+    assert fused_epsilon_calls == [effective_epsilon] * len(inputs)
+    assert type(normalization) is torch.nn.RMSNorm
+    assert normalization.eps == epsilon
+    assert "forward" not in unsupported.__dict__
+    assert "forward" not in unaffined.__dict__
+    assert all(
+        before is after
+        for before, after in zip(parameters_before, modules.parameters(), strict=True)
+    )
+    for name, value in modules.state_dict().items():
+        torch.testing.assert_close(value, state_before[name], rtol=0, atol=0)

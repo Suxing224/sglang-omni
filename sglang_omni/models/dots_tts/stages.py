@@ -9,7 +9,7 @@ import math
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -36,6 +36,7 @@ else:
     pass
 
 _DEFAULT_CONTEXT_LENGTH = 2048
+APOSTROPHE_TRANSLATION = str.maketrans({"\u2018": "'", "\u2019": "'"})
 
 
 def configure_optimized_kernels() -> None:
@@ -233,7 +234,9 @@ def preprocess_dots_tts_payload(
             default=False,
         )
     )
-    text = normalize_text(text.strip()) if normalize else text.strip()
+    # note (codex): Typographic apostrophes must not turn contractions into spoken letters.
+    text = text.strip().translate(APOSTROPHE_TRANSLATION)
+    text = normalize_text(text) if normalize else text
     language_value = first_not_none(
         request_inputs.get("language"), tts_params.get("language")
     )
@@ -253,7 +256,9 @@ def preprocess_dots_tts_payload(
         pass
     normalized_prompt_text = ""
     if prompt_text and prompt_text.strip():
-        normalized_prompt_text = prompt_text.strip() + "\n"
+        normalized_prompt_text = (
+            prompt_text.strip().translate(APOSTROPHE_TRANSLATION) + "\n"
+        )
         if language is not None:
             normalized_prompt_text = attach_language_tag(
                 normalized_prompt_text, language
@@ -459,12 +464,25 @@ def create_reference_encode_executor(
     max_concurrency: int = 8,
     max_batch_size: int = 1,
     max_batch_wait_ms: float = 4.0,
+    npu_convolution_allow_hf32: bool | None = None,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
+    """Build reference encoding with optional worker-wide NPU precision."""
     concrete_device = resolve_concrete_device(device, gpu_id)
     if concrete_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("dots.tts requires CUDA")
     else:
         pass
+    if npu_convolution_allow_hf32 is None:
+        pass
+    elif concrete_device.type != "npu":
+        raise ValueError("npu_convolution_allow_hf32 requires an NPU reference worker")
+    else:
+        # note (codex): Configure the isolated worker before its first convolution.
+        device_module = torch.get_device_module(concrete_device)
+        device_module.conv.allow_hf32 = npu_convolution_allow_hf32
+        logging.getLogger(__name__).info(
+            f"dots.tts reference NPU convolution allow_hf32={device_module.conv.allow_hf32}"
+        )
     codec = load_dots_audio_codec(model_path, device=str(concrete_device))
     encoder = DotsReferenceEncoder(
         codec,
@@ -521,13 +539,28 @@ def create_vocoder_executor(
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
     stream_slots: int = 16,
+    npu_decoder_precision: Literal["float32", "float16"] = "float32",
 ) -> DotsTTSStreamingVocoder:
     concrete_device = resolve_concrete_device(device, gpu_id)
     if concrete_device.type == "cpu":
         raise RuntimeError("dots.tts requires an accelerator")
     else:
         pass
-    codec = load_dots_audio_codec(model_path, device=str(concrete_device))
+    if npu_decoder_precision not in {"float32", "float16"}:
+        raise ValueError(f"Unsupported NPU decoder precision: {npu_decoder_precision}")
+    elif npu_decoder_precision == "float16" and concrete_device.type != "npu":
+        raise ValueError("NPU decoder precision requires an NPU vocoder worker")
+    else:
+        pass
+    codec = load_dots_audio_codec(
+        model_path,
+        device=str(concrete_device),
+        decoder_dtype=torch.float16 if npu_decoder_precision == "float16" else None,
+    )
+    if npu_decoder_precision == "float16":
+        logging.getLogger(__name__).info("dots.tts NPU decoder precision=float16")
+    else:
+        pass
     vocoder = DotsTTSStreamingVocoder(
         codec,
         optimize=optimize,
@@ -541,7 +574,7 @@ def create_vocoder_executor(
     # mismatch surface before readiness, not on the first live chunk.
     vocoder.ensure_slot_pool()
     backend = (
-        f"{vocoder.cuda_graph_count} step CUDA graphs"
+        f"{vocoder.cuda_graph_count} step {concrete_device.type} graphs"
         if vocoder.cuda_graph_count
         else "eager step"
     )

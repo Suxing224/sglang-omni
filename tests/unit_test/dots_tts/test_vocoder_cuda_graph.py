@@ -9,14 +9,29 @@ changes the waveform instead of cancelling out.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_convolutions
 from sglang_omni.models.dots_tts.vocoder import DotsTTSStreamingVocoder
-from sglang_omni.models.dots_tts.vocoder_cuda_graph import DotsVocoderGraphRunner
+from sglang_omni.models.dots_tts.vocoder_cuda_graph import (
+    DotsVocoderGraphRunner,
+    capture_device_graph,
+)
 from sglang_omni.models.dots_tts.vocoder_slot_pool import DotsVocoderSlotPool
+from sglang_omni.platforms import current_platform
+
+import_dots_tts()
+
+from dots_tts.modules.backbone.layers import Conv1d, ConvTranspose1d
+from dots_tts.modules.vocoder.alias_free_filter import LowPassFilter1d
+from dots_tts.modules.vocoder.alias_free_resample import UpSample1d
 
 LATENT_DIM = 5
 HIDDEN = 8
@@ -25,6 +40,101 @@ PATCH = 4
 MERGE = 4
 CHUNK = PATCH * MERGE
 NUM_SLOTS = 6
+MODEL_MAX_GENERATE_PATCHES = 500
+MODEL_PATCH_FRAMES = 4
+MODEL_HOP_SAMPLES = 1920
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize(
+    "channels, samples, ratio, kernel_size, fixed_filter, causal",
+    [
+        (channels, samples, ratio, kernel_size, fixed_filter, causal)
+        for channels, samples, ratio, kernel_size in (
+            (48, 61440, 2, 12),
+            (24, 122880, 2, 12),
+            (3, 5, 3, 17),
+            (3, 1, 2, 11),
+        )
+        for fixed_filter in (False, True)
+        for causal in (False, True)
+    ]
+    + [
+        (
+            24,
+            MODEL_MAX_GENERATE_PATCHES * MODEL_PATCH_FRAMES * MODEL_HOP_SAMPLES,
+            2,
+            12,
+            False,
+            True,
+        )
+    ],
+)
+@torch.inference_mode()
+def test_long_upsampling_matches_filter_definition_after_graph_replay(
+    graph_device: torch.device,
+    channels: int,
+    samples: int,
+    ratio: int,
+    kernel_size: int,
+    fixed_filter: bool,
+    causal: bool,
+) -> None:
+    module = UpSample1d(
+        channels=channels,
+        causal=causal,
+        fixed_filter=fixed_filter,
+        ratio=ratio,
+        kernel_size=kernel_size,
+    )
+    generator = torch.Generator().manual_seed(17)
+    module.filter.add_(torch.randn(module.filter.shape, generator=generator) * 0.02)
+    filter_weights = module.filter.detach().expand(channels, -1, -1).clone()
+    module.to(graph_device)
+    if graph_device.type == "npu":
+        # note (codex): Reproduce the format policy enabled by engine initialization.
+        torch.get_device_module(graph_device).config.allow_internal_format = True
+        adapt_audio_vae_convolutions(module)
+    else:
+        pass
+    waveform = torch.zeros(1, channels, samples, device=graph_device)
+    device_module = torch.get_device_module(graph_device)
+    capture_stream = device_module.Stream(device=graph_device)
+    capture_stream.wait_stream(device_module.current_stream(graph_device))
+    with device_module.stream(capture_stream):
+        module(waveform)
+        module(waveform)
+    capture_stream.synchronize()
+    with capture_device_graph(
+        device=graph_device,
+        graph_pool=device_module.graph_pool_handle(),
+        capture_stream=capture_stream,
+    ) as graph:
+        actual = module(waveform)
+    device_module.current_stream(graph_device).wait_stream(capture_stream)
+    generator = torch.Generator().manual_seed(42)
+    for _ in range(2):
+        reference_waveform = (
+            torch.randn(1, channels, samples, generator=generator) * 0.2
+        )
+        reference_waveform[..., [0, samples // 2, samples - 1]] = 1.0
+        padded = F.pad(reference_waveform, (module.pad, module.pad), mode="replicate")
+        inserted = F.pad(padded.unsqueeze(-1), (0, module.stride - 1)).flatten(-2)
+        convolution_windows = F.pad(
+            inserted, (module.kernel_size - 1, module.kernel_size - module.stride)
+        ).unfold(-1, module.kernel_size, 1)
+        expected = module.ratio * (
+            convolution_windows * filter_weights.flip(-1).unsqueeze(0)
+        ).sum(-1)
+        if module.causal:
+            expected = expected[..., : -(module.kernel_size - module.stride)]
+        else:
+            expected = expected[..., module.pad_left : -module.pad_right]
+        waveform.copy_(reference_waveform)
+        graph.replay()
+        observed = actual.cpu()
+        assert torch.isfinite(observed).all()
+        torch.testing.assert_close(observed, expected, rtol=1e-3, atol=3e-4)
 
 
 class NonlinearInference:
@@ -138,13 +248,61 @@ def assert_same_outputs(reference, candidate) -> None:
             )
 
 
-@pytest.fixture
-def cuda_device() -> torch.device:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
+@pytest.mark.accelerator
+def test_replay_preserves_temporary_inputs_across_caller_streams(
+    graph_device: torch.device,
+) -> None:
+    device_module = torch.get_device_module(graph_device)
+    steps = scenario_inputs(graph_device) * 20
+    reference = run_scenario(make_pool(graph_device), steps)
+    pool = make_pool(graph_device, graph_keys=ALL_KEYS)
+    caller_streams = [device_module.Stream(device=graph_device) for _ in range(2)]
+    setup_stream = device_module.current_stream(graph_device)
+
+    def replay_steps() -> list[dict[int, torch.Tensor]]:
+        with device_module.device(graph_device):
+            current_stream = device_module.current_stream(graph_device)
+            current_stream.wait_stream(setup_stream)
+            for _ in range(4):
+                pool.acquire()
+            previous_stream = current_stream
+            outputs: list[dict[int, torch.Tensor]] = []
+            for step_index, step in enumerate(steps):
+                caller_stream = caller_streams[step_index % len(caller_streams)]
+                caller_stream.wait_stream(previous_stream)
+                with device_module.stream(caller_stream):
+                    temporary_inputs = {
+                        slot: latents.clone() for slot, latents in step.items()
+                    }
+                    outputs.append(pool.step(temporary_inputs))
+                    temporary_inputs.clear()
+                    for latents in step.values():
+                        torch.empty_like(latents).fill_(1234.0)
+                previous_stream = caller_stream
+            current_stream.wait_stream(previous_stream)
+            outputs.append({slot: pool.flush(slot) for slot in range(4)})
+            return outputs
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        actual = executor.submit(replay_steps).result()
+    assert_same_outputs(reference, actual)
+
+
+@pytest.fixture(params=["cuda", "npu"])
+def graph_device(request: pytest.FixtureRequest) -> torch.device:
+    device_type = request.param
+    if current_platform.device_type != device_type:
+        pytest.skip(
+            f"requires {device_type}; this host uses {current_platform.device_type}"
+        )
     else:
         pass
-    return torch.device("cuda")
+    device_module = torch.get_device_module(device_type)
+    if not device_module.is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    else:
+        pass
+    return torch.device(device_type, device_module.current_device())
 
 
 ALL_KEYS = [
@@ -162,10 +320,51 @@ ALL_KEYS = [
 
 
 @pytest.mark.accelerator
-def test_graph_step_is_bit_identical_to_eager_across_aging_rows(
-    cuda_device: torch.device,
+@torch.inference_mode()
+def test_real_convolutions_capture_and_replay_long_causal_waveforms(
+    graph_device: torch.device,
 ) -> None:
-    device = cuda_device
+    torch.manual_seed(42)
+    original = torch.nn.Sequential(
+        Conv1d(4, 4, 3, dilation=2, groups=4, causal=True),
+        ConvTranspose1d(4, 4, 4, stride=2, groups=4, causal=True),
+        UpSample1d(channels=4, causal=True, fixed_filter=True),
+        LowPassFilter1d(channels=4, causal=True, fixed_filter=False, stride=2),
+    ).to(graph_device)
+    candidate = deepcopy(original)
+    if graph_device.type == "npu":
+        adapt_audio_vae_convolutions(candidate)
+    else:
+        pass
+    waveform = torch.randn(2, 4, 2300, device=graph_device)
+    device_module = torch.get_device_module(graph_device)
+    capture_stream = device_module.Stream(device=graph_device)
+    capture_stream.wait_stream(device_module.current_stream(graph_device))
+    with device_module.stream(capture_stream):
+        candidate(waveform)
+        candidate(waveform)
+    capture_stream.synchronize()
+    with capture_device_graph(
+        device=graph_device,
+        graph_pool=device_module.graph_pool_handle(),
+        capture_stream=capture_stream,
+    ) as graph:
+        actual = candidate(waveform)
+    device_module.current_stream(graph_device).wait_stream(capture_stream)
+    for _ in range(3):
+        waveform.normal_()
+        expected = original(waveform)
+        graph.replay()
+        device_module.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+    graph.reset()
+
+
+@pytest.mark.accelerator
+def test_graph_step_is_bit_identical_to_eager_across_aging_rows(
+    graph_device: torch.device,
+) -> None:
+    device = graph_device
     steps = scenario_inputs(device)
     reference = run_scenario(make_pool(device), steps)
 
@@ -178,9 +377,9 @@ def test_graph_step_is_bit_identical_to_eager_across_aging_rows(
 
 @pytest.mark.accelerator
 def test_uncaptured_shape_falls_back_to_eager_bit_identically(
-    cuda_device: torch.device,
+    graph_device: torch.device,
 ) -> None:
-    device = cuda_device
+    device = graph_device
     steps = scenario_inputs(device)
     reference = run_scenario(make_pool(device), steps)
 
@@ -242,8 +441,8 @@ def test_capture_keys_match_serving_shapes(
 
 
 @pytest.mark.accelerator
-def test_default_vocoder_captures_serving_shapes(cuda_device: torch.device) -> None:
-    vocoder = make_streaming_vocoder(cuda_device)
+def test_default_vocoder_captures_serving_shapes(graph_device: torch.device) -> None:
+    vocoder = make_streaming_vocoder(graph_device)
     pool = vocoder.ensure_slot_pool()
     assert pool.graph_runner.captured_keys == ALL_KEYS
     assert vocoder.ensure_slot_pool() is pool
@@ -252,9 +451,9 @@ def test_default_vocoder_captures_serving_shapes(cuda_device: torch.device) -> N
 @pytest.mark.accelerator
 @pytest.mark.parametrize("failure_call", [1, 3], ids=["warmup", "capture"])
 def test_capture_failure_aborts_pool_setup(
-    cuda_device: torch.device, monkeypatch: pytest.MonkeyPatch, failure_call: int
+    graph_device: torch.device, monkeypatch: pytest.MonkeyPatch, failure_call: int
 ) -> None:
-    vocoder = make_streaming_vocoder(cuda_device)
+    vocoder = make_streaming_vocoder(graph_device)
     decode_window = (
         vocoder.codec.inference._decode_stream_window
     )  # noqa: leading-underscore  # AudioVAE interface

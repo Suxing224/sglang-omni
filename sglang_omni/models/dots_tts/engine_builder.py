@@ -7,6 +7,8 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.engine_factory import (
@@ -73,7 +75,11 @@ class DotsTTSEngineBuilder(TtsEngineBuilder["DotsTTSSGLangRequestData"]):
         # tail is eager, so skip the process-global compile policy otherwise.
         # The policy must exist before SGLang builds the model; applying it in
         # setup_model nests Dynamo under FX.
-        if self.optimize and int(cfg.max_running_requests) == 1:
+        if (
+            self.optimize
+            and int(cfg.max_running_requests) == 1
+            and torch.device(self.device).type == "cuda"
+        ):
             from sglang_omni.models.dots_tts.stages import configure_optimized_kernels
 
             configure_optimized_kernels()
@@ -167,29 +173,24 @@ class DotsTTSEngineBuilder(TtsEngineBuilder["DotsTTSSGLangRequestData"]):
         else:
             pass
         if max_running_requests == 1:
-            tail_backend = (
-                "compiled single-request DiT/semantic encoder"
-                if model.flow.optimize
-                else "eager single-request DiT/semantic encoder"
-            )
+            if model.flow.optimize and next(model.parameters()).device.type == "cuda":
+                tail_backend = "compiled single-request DiT/semantic encoder"
+            elif model.flow.optimize:
+                tail_backend = "cached single-request DiT/semantic encoder"
+            else:
+                tail_backend = "eager single-request DiT/semantic encoder"
         else:
             tail_backend = model.flow.batched_tail.backend
         logger.info(
-            "dots.tts latent engine backend: %s (optimize=%s, "
-            "max_running_requests=%d, num_steps=%d)",
-            tail_backend,
-            self.optimize,
-            max_running_requests,
-            self.num_steps,
+            f"dots.tts latent engine backend: {tail_backend} (optimize={self.optimize}, "
+            f"max_running_requests={max_running_requests}, num_steps={self.num_steps})"
         )
-        logger.info(
-            "dots.tts backbone decode: %s",
-            (
-                "SGLang CUDA graph with model-owned feedback buffer"
-                if not bool(get_exec().graph.disable_cuda_graph)
-                else "eager"
-            ),
+        backbone_backend = (
+            "SGLang device graph with model-owned feedback buffer"
+            if not bool(get_exec().graph.disable_cuda_graph)
+            else "eager"
         )
+        logger.info(f"dots.tts backbone decode: {backbone_backend}")
 
     def make_model_runner(
         self,

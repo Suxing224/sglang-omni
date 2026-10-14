@@ -84,6 +84,41 @@ On a full GPU the default `16 × 500` layout is intended. On tighter cards, lowe
 
 Incremental / bucketed tail-KV allocation is not implemented yet; capacity is still the eager full-length pool.
 
+## Ascend NPU (MeanFlow)
+
+The NPU recipe supports the pinned MeanFlow checkpoint on one Ascend device.
+SOAR and base have not been validated on NPU. The tested stack is
+Ascend910_9362, CANN 9.0.0, PyTorch/torch_npu 2.10.0, SGLang 0.5.21,
+and dots_tts 0.2.1. Follow the [NPU installation guide](../get_started/installation_npu.md).
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0
+
+sgl-omni serve \
+  --config examples/configs/dots_tts_npu.yaml \
+  --allowed-local-media-path docs/_static/audio \
+  --port 8000
+```
+
+Select an available device for your runtime. The request examples below also
+apply to this deployment.
+
+The configuration uses separate processes for reference encoding, latent
+generation, and waveform decoding. It enables 16 acoustic slots, a maximum of
+500 generated patches, four solver steps, and backbone, acoustic-tail, and
+streaming-vocoder device graphs. Backbone attention uses Ascend, sampling uses
+PyTorch, and the backbone KV cache is 2 GiB.
+
+Keep reference encoding and waveform decoding in separate processes: reference
+encoding sets npu_convolution_allow_hf32 to false, and the AudioVAE adapter
+disables NPU internal formats before graph capture. These SDK settings are
+process-wide; custom process groupings need validation.
+
+The stage reservations total 55 GiB for placement accounting; they are not
+allocator limits. Check available device memory before launching the service.
+Streaming works, but uninterrupted real-time playback at concurrency 16 is not
+currently established.
+
 ## Synthesizing Speech
 
 dots.tts needs a reference clip and its transcript. The speaker comes entirely from the reference (x-vector plus prompt latents), so there is no zero-shot `voice` preset. Under the default continuous-batching deployment, a request without `references` is rejected.
@@ -215,6 +250,11 @@ A rejected solver value comes back as HTTP 500 with the engine's message, for ex
 ### Performance
 
 Seed-TTS EN benchmark at main commit `2b45073c`, seed 42, with 10 warmup requests. Throughput and latency were measured on **1x H100**. The server used `examples/configs/dots_tts.yaml`, which enables the optimized acoustic tail, vocoder, and backbone CUDA Graph. Every row uses all 1,088 samples.
+
+These H100 measurements were reported by luojiaxuan in
+[PR #1482](https://github.com/sgl-project/sglang-omni/pull/1482); they are not tests
+of the NPU patch. The historical TTS and ASR checkpoint revisions still need to
+be matched before using these numbers to judge cross-platform accuracy.
 
 | Concurrency | Throughput (req/s) | Mean latency | RTF (per-req) | audio_s/s | WER |
 |---:|---:|---:|---:|---:|---:|

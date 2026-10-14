@@ -103,6 +103,7 @@ class DotsVocoderSlotPool:
             pass
         self.inference = inference
         self.graph_runner: DotsVocoderGraphRunner | None = None
+        self.prefix_graph_runners: dict[int, DotsVocoderGraphRunner] = {}
         self.num_slots = int(num_slots)
         self.chunk_size = int(chunk_size)
         # note (guozhihao-224): probe shapes through the public stream-state
@@ -239,10 +240,21 @@ class DotsVocoderSlotPool:
         self.inference._validate_stream_latents(
             packed
         )  # noqa: leading-underscore  # AudioVAE API spelling
+        graph_runner = self.graph_runner
+        required_frames = max(self.total_frames[slot] + step_t for slot in slots)
+        for decoder_frames, prefix_runner in sorted(self.prefix_graph_runners.items()):
+            if (
+                required_frames <= decoder_frames
+                and (len(slots), step_t) in prefix_runner.captured_keys
+            ):
+                graph_runner = prefix_runner
+                break
+            else:
+                pass
         replayed = (
             None
-            if self.graph_runner is None
-            else self.graph_runner.run(packed, hidden_h, hidden_c, window, valid)
+            if graph_runner is None
+            else graph_runner.run(packed, hidden_h, hidden_c, window, valid)
         )
         audio_window, hidden_h, hidden_c, new_window = (
             self.forward(packed, hidden_h, hidden_c, window, valid)
@@ -267,6 +279,8 @@ class DotsVocoderSlotPool:
         hidden_c: torch.Tensor,
         window: torch.Tensor,
         valid: torch.Tensor,
+        *,
+        decoder_window_frames: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # note (lennox): CUDA graph capture boundary; keep slot bookkeeping and
         # anything host-side out of it.
@@ -280,8 +294,13 @@ class DotsVocoderSlotPool:
             )
         )
         new_window = append_decoder_input_per_row(decoder_input, window, valid)
-        audio_window = inference._decode_stream_window(
+        decoder_window = (
             new_window
+            if decoder_window_frames is None
+            else new_window[..., :decoder_window_frames].contiguous()
+        )
+        audio_window = inference._decode_stream_window(
+            decoder_window
         )  # noqa: leading-underscore  # AudioVAE API spelling
         return audio_window, hidden_h, hidden_c, new_window
 
