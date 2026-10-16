@@ -239,6 +239,73 @@ def test_stream_chunk_batch_cap_follows_max_batch_size_not_slots() -> None:
     assert vocoder.stream_slots == 1
 
 
+def test_select_step_participants_defers_fresh_small_groups() -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        merge_steps=2,
+        max_batch_size=4,
+        stream_slots=4,
+        stream_group_wait_ms=100,
+        slot_pool=pool,
+    )
+    state = vocoder.create_stream_state("a")
+    vocoder.stream_states["a"] = state
+    vocoder.ingest("a", state, patch(1.0))
+    assert state.ready_since_ns is not None
+
+    # A freshly-ready group below the cap waits for more arrivals.
+    assert vocoder.select_step_participants() == []
+    # Once aged past the wait bound it steps immediately.
+    state.ready_since_ns -= 200_000_000
+    assert [request_id for request_id, _ in vocoder.select_step_participants()] == ["a"]
+
+
+def test_select_step_participants_full_group_steps_immediately() -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        merge_steps=2,
+        max_batch_size=4,
+        stream_slots=4,
+        stream_group_wait_ms=100,
+        slot_pool=pool,
+    )
+    for request_id in ("a", "b", "c", "d"):
+        state = vocoder.create_stream_state(request_id)
+        vocoder.stream_states[request_id] = state
+        vocoder.ingest(request_id, state, patch(float(ord(request_id))))
+
+    participants = vocoder.select_step_participants()
+    assert len(participants) == 4
+
+
+def test_group_wait_resets_after_draining_pending_patches() -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        merge_steps=2,
+        max_batch_size=4,
+        stream_slots=4,
+        stream_group_wait_ms=100,
+        slot_pool=pool,
+    )
+    fresh = vocoder.create_stream_state("fresh")
+    vocoder.stream_states["fresh"] = fresh
+    vocoder.ingest("fresh", fresh, patch(1.0))
+    fresh.ready_since_ns -= 200_000_000
+    participants = vocoder.select_step_participants()
+    plan = vocoder.build_step_plan(participants)
+    vocoder.run_step(participants, plan)
+    # The step drained the only pending patch, so the state is no longer ready
+    # and its age marker resets for the next accumulation cycle.
+    assert fresh.ready_since_ns is None
+    assert vocoder.select_step_participants() == []
+
+
 def test_streaming_groups_by_exact_frame_count() -> None:
     pool = RecordingSlotPool()
     vocoder = DotsTTSStreamingVocoder(
@@ -246,6 +313,7 @@ def test_streaming_groups_by_exact_frame_count() -> None:
         optimize=True,
         merge_steps=2,
         stream_slots=4,
+        stream_group_wait_ms=0,
         slot_pool=pool,
     )
     early = vocoder.create_stream_state("early")
@@ -286,6 +354,26 @@ def test_stream_done_flushes_and_releases_slot() -> None:
     assert slot not in pool.in_use
 
 
+def test_stream_done_drains_large_backlog_in_merge_step_pieces() -> None:
+    # Group-wait deferral can leave more pending patches than one window
+    # allows; the final drain must split them like the coalesced pump does.
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        merge_steps=2,
+        slot_pool=pool,
+    )
+    state = vocoder.create_stream_state("req")
+    for value in (1.0, 2.0, 3.0, 4.0, 5.0):
+        vocoder.ingest("req", state, patch(value))
+    waveform = vocoder.decode_delta("req", state, is_final=True)
+    assert waveform is not None
+    frames = [int(latents.shape[1]) for step in pool.steps for latents in step.values()]
+    assert frames == [6, 6, 3]
+    assert state.pending == []
+
+
 def test_release_stream_resources_returns_slot() -> None:
     pool = RecordingSlotPool()
     vocoder = DotsTTSStreamingVocoder(
@@ -323,6 +411,7 @@ def test_on_stream_chunk_batch_uses_pool_not_compiled_stream_step() -> None:
         codec,
         optimize=True,
         merge_steps=2,
+        stream_group_wait_ms=0,
         slot_pool=pool,
     )
     payload_state = vocoder.create_stream_state("req")

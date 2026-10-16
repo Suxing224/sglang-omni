@@ -535,10 +535,13 @@ def create_vocoder_executor(
     gpu_id: int | None = None,
     optimize: bool = True,
     enable_streaming_audio_vae_cuda_graph: bool = True,
+    enable_streaming_conv_cache: bool = True,
     vocoder_merge_steps: int = 4,
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
     stream_slots: int = 16,
+    stream_group_wait_ms: float = 0.0,
+    stream_chunk_batch_max: int | None = None,
     npu_decoder_precision: Literal["float32", "float16"] = "float32",
 ) -> DotsTTSStreamingVocoder:
     concrete_device = resolve_concrete_device(device, gpu_id)
@@ -565,10 +568,13 @@ def create_vocoder_executor(
         codec,
         optimize=optimize,
         enable_streaming_audio_vae_cuda_graph=enable_streaming_audio_vae_cuda_graph,
+        enable_streaming_conv_cache=enable_streaming_conv_cache,
         merge_steps=vocoder_merge_steps,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         stream_slots=stream_slots,
+        stream_group_wait_ms=stream_group_wait_ms,
+        stream_chunk_batch_max=stream_chunk_batch_max,
     )
     # note (guozhihao-224): allocate the slot pool at setup so OOM / shape
     # mismatch surface before readiness, not on the first live chunk.
@@ -582,7 +588,8 @@ def create_vocoder_executor(
         f"dots.tts vocoder backend: slot-pooled streaming, {backend} "
         f"(optimize={optimize}, merge_steps={vocoder.merge_steps}, "
         f"stream_slots={vocoder.stream_slots}, batch_size={max_batch_size}, "
-        f"stream_batch_cap={vocoder.stream_chunk_batch_max}, wait_ms={max_batch_wait_ms})"
+        f"stream_batch_cap={vocoder.stream_chunk_batch_max}, wait_ms={max_batch_wait_ms}, "
+        f"group_wait_ms={vocoder.stream_group_wait_ms})"
     )
     return vocoder
 

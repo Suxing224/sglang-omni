@@ -105,7 +105,7 @@ apply to this deployment.
 
 The configuration uses separate processes for reference encoding, latent
 generation, and waveform decoding. It enables 16 acoustic slots, a maximum of
-500 generated patches, four solver steps, and backbone, acoustic-tail, and
+500 generated patches, four solver steps, and backbone decode, acoustic-tail, and
 streaming-vocoder device graphs. Backbone attention uses Ascend, sampling uses
 PyTorch, and the backbone KV cache is 2 GiB.
 

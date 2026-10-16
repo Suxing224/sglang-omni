@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang_omni.models.dots_tts.flow_head import DotsTTSFlowHead
+from sglang_omni.models.dots_tts.flow_head import (
+    DotsFlowState,
+    DotsFlowStep,
+    DotsTTSFlowHead,
+)
 from sglang_omni.platforms import current_platform
 
 LLM_HIDDEN = 48
@@ -546,6 +550,81 @@ def test_batched_eos_resolve_reads_staged_flags(tmp_path) -> None:
     assert flow.resolve_batched_eos() == [False, False]
     assert not flow.has_pending_batched_eos
     assert flow.resolve_batched_eos() == []
+
+
+@pytest.mark.parametrize("failure_stage", ["sample_patches", "encode_feedback"])
+@pytest.mark.parametrize(
+    "use_accelerator",
+    [False, pytest.param(True, marks=pytest.mark.accelerator)],
+)
+def test_batched_decode_failure_does_not_poison_subsequent_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    use_accelerator: bool,
+) -> None:
+    """A failed acoustic step retires its EOS transfer before another request starts."""
+    device = require_flow_device() if use_accelerator else torch.device("cpu")
+    flow = flow_head(tmp_path).to(device)
+    flow.init_batched_tail(num_slots=2, nfe=NFE, max_audio_patches=8)
+
+    def new_state(seed: int) -> DotsFlowState:
+        state, _ = flow.new_request(
+            max_audio_patch_count=6,
+            prompt_latents=torch.randn(1, 2 * PATCH_SIZE, LATENT_DIM, device=device),
+            speaker_embedding=None,
+            speaker_scale=1.0,
+            rng=seed,
+        )
+        flow.initialize_history(
+            state,
+            hidden_states=torch.randn(1, 3, LLM_HIDDEN, device=device),
+            prompt_span_positions=torch.tensor([1, 2]),
+            audio_span_token_ids={1},
+            generation_schedule=torch.tensor([[0, 1, 1, 1]]),
+            prefill_end=3,
+            decoded_latent_patches=[],
+        )
+        return state
+
+    def decode(state: DotsFlowState) -> list[DotsFlowStep]:
+        return flow.decode_batch(
+            [state],
+            hidden_states=torch.randn(1, LLM_HIDDEN, device=device),
+            num_steps=[NFE],
+            ode_methods=["euler"],
+            guidance_scales=[1.0],
+            eos_thresholds=[2.0],
+            append_hidden=False,
+        )
+
+    state = new_state(11)
+
+    def fail_sample(slots: list[int], *, fm_hidden_rows: torch.Tensor) -> torch.Tensor:
+        assert slots == [state.slot] and fm_hidden_rows.shape[0] == 1
+        assert flow.has_pending_batched_eos
+        raise RuntimeError("injected sampling failure")
+
+    def fail_feedback(slots: list[int], patches: torch.Tensor) -> torch.Tensor:
+        assert slots == [state.slot] and patches.shape[0] == 1
+        assert flow.has_pending_batched_eos
+        raise RuntimeError("injected feedback failure")
+
+    with monkeypatch.context() as failure_patch:
+        failure_patch.setattr(
+            flow.tail,
+            failure_stage,
+            fail_sample if failure_stage == "sample_patches" else fail_feedback,
+        )
+        with pytest.raises(RuntimeError, match="injected"):
+            decode(state)
+    assert not flow.has_pending_batched_eos
+    flow.release_request(state)
+    subsequent = new_state(12)
+    [step] = decode(subsequent)
+    assert torch.isfinite(step.latent_patch).all()
+    assert flow.resolve_batched_eos() == [False]
+    flow.release_request(subsequent)
 
 
 def test_batched_eos_staging_requires_resolve_before_reuse(tmp_path) -> None:

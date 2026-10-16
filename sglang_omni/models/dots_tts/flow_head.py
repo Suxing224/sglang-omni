@@ -696,7 +696,16 @@ class DotsTTSFlowHead(nn.Module):
             self.validate_request(num_steps=steps, ode_method=method)
         hidden = hidden_states[:, -1] if hidden_states.ndim == 3 else hidden_states
         probabilities = self.eos_proj(hidden).softmax(dim=-1)[:, 1]
-        eos_hits = probabilities.gt(probabilities.new_tensor(eos_thresholds))
+        if probabilities.device.type == "npu":
+            eos_threshold_values = torch.tensor(
+                eos_thresholds,
+                device="cpu",
+                dtype=probabilities.dtype,
+                pin_memory=True,
+            ).to(probabilities.device, non_blocking=True)
+        else:
+            eos_threshold_values = probabilities.new_tensor(eos_thresholds)
+        eos_hits = probabilities.gt(eos_threshold_values)
         for row, state in enumerate(states):
             if state.suppress_first_eos_check and state.decoded_patches == 0:
                 eos_hits[row] = False
@@ -707,31 +716,36 @@ class DotsTTSFlowHead(nn.Module):
             raise RuntimeError("dots.tts batched request is missing its tail slot")
         else:
             pass
-        normalized = self.tail.sample_patches(
-            slots, fm_hidden_rows=self.hidden_proj(hidden)
-        )
-        latent_patches = self.io.denormalize(normalized)
-        patch_encoder_input = (
-            normalized
-            if self.patch_encoder.expects_normalized_input
-            else latent_patches
-        ).to(dtype=next(self.patch_encoder.parameters()).dtype)
-        feedback = self.tail.encode_feedback(slots, patch_encoder_input)
-        self.tail.note_decode_cycle()
+        # note (codex): Launch the EOS transfer before DiT to overlap its device work.
         self.stage_batched_eos(eos_hits)
-        results = []
-        for row, state in enumerate(states):
-            emit = not state.drop_regenerated_prompt_patch
-            state.drop_regenerated_prompt_patch = False
-            state.decoded_patches += 1
-            results.append(
-                DotsFlowStep(
-                    latent_patch=latent_patches[row : row + 1],
-                    feedback_embedding=feedback[row],
-                    finished=False,
-                    emit=emit,
-                )
+        try:
+            normalized = self.tail.sample_patches(
+                slots, fm_hidden_rows=self.hidden_proj(hidden)
             )
+            latent_patches = self.io.denormalize(normalized)
+            patch_encoder_input = (
+                normalized
+                if self.patch_encoder.expects_normalized_input
+                else latent_patches
+            ).to(dtype=next(self.patch_encoder.parameters()).dtype)
+            feedback = self.tail.encode_feedback(slots, patch_encoder_input)
+            self.tail.note_decode_cycle()
+            results = []
+            for row, state in enumerate(states):
+                emit = not state.drop_regenerated_prompt_patch
+                state.drop_regenerated_prompt_patch = False
+                state.decoded_patches += 1
+                results.append(
+                    DotsFlowStep(
+                        latent_patch=latent_patches[row : row + 1],
+                        feedback_embedding=feedback[row],
+                        finished=False,
+                        emit=emit,
+                    )
+                )
+        except BaseException:
+            self.resolve_batched_eos()
+            raise
         return results
 
     @property

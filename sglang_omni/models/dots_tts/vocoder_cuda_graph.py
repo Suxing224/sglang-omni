@@ -13,8 +13,8 @@ import torch
 logger = logging.getLogger(__name__)
 HIT_RATE_LOG_EVERY = 1024
 
-StepInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-StepOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+StepInputs = tuple[torch.Tensor, ...]
+StepOutputs = tuple[torch.Tensor, ...]
 
 
 class ReplayableGraph(Protocol):
@@ -50,7 +50,7 @@ def capture_device_graph(
         raise RuntimeError(f"dots.tts has no graph backend for {device}")
 
 
-class StepForward(Protocol):
+class WindowStepForward(Protocol):
     def __call__(
         self,
         packed: torch.Tensor,
@@ -61,17 +61,26 @@ class StepForward(Protocol):
     ) -> StepOutputs: ...
 
 
+class ConvCacheStepForward(Protocol):
+    def __call__(
+        self,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        flat_cache: torch.Tensor,
+    ) -> StepOutputs: ...
+
+
+StepForward = WindowStepForward | ConvCacheStepForward
+
+
 class StepInputFactory(Protocol):
     def __call__(self, batch_size: int, frames: int) -> StepInputs: ...
 
 
 class CapturedStepGraph(NamedTuple):
     graph: ReplayableGraph
-    packed: torch.Tensor
-    hidden_h: torch.Tensor
-    hidden_c: torch.Tensor
-    window: torch.Tensor
-    valid: torch.Tensor
+    inputs: StepInputs
     outputs: StepOutputs
     capture_stream: torch.Stream
 
@@ -135,7 +144,7 @@ class DotsVocoderGraphRunner:
                 ) as graph:
                     outputs = self.forward(*inputs)
                 self.graphs[key] = CapturedStepGraph(
-                    graph, *inputs, outputs, capture_stream
+                    graph, inputs, outputs, capture_stream
                 )
             current_stream.wait_stream(capture_stream)
             device_module.synchronize(self.device)
@@ -144,14 +153,8 @@ class DotsVocoderGraphRunner:
         )
 
     @torch.no_grad()
-    def run(
-        self,
-        packed: torch.Tensor,
-        hidden_h: torch.Tensor,
-        hidden_c: torch.Tensor,
-        window: torch.Tensor,
-        valid: torch.Tensor,
-    ) -> StepOutputs | None:
+    def run(self, step_inputs: StepInputs) -> StepOutputs | None:
+        packed = step_inputs[0]
         captured = self.graphs.get((int(packed.shape[0]), int(packed.shape[2])))
         if captured is None:
             self.misses += 1
@@ -162,17 +165,16 @@ class DotsVocoderGraphRunner:
             if self.device.type == "npu":
                 # note (codex): Keep NPU graph outputs ordered with their capture stream.
                 captured.capture_stream.wait_stream(current_stream)
-                for tensor in (packed, hidden_h, hidden_c, window, valid):
-                    tensor.record_stream(captured.capture_stream)
+                for live_input in step_inputs:
+                    live_input.record_stream(captured.capture_stream)
                 execution_context = device_module.stream(captured.capture_stream)
             else:
                 execution_context = nullcontext()
             with execution_context:
-                captured.packed.copy_(packed)
-                captured.hidden_h.copy_(hidden_h)
-                captured.hidden_c.copy_(hidden_c)
-                captured.window.copy_(window)
-                captured.valid.copy_(valid)
+                for static_input, live_input in zip(
+                    captured.inputs, step_inputs, strict=True
+                ):
+                    static_input.copy_(live_input)
                 captured.graph.replay()
                 self.replays += 1
                 outputs = tuple(output.clone() for output in captured.outputs)

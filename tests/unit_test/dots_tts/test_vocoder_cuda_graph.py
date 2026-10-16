@@ -8,6 +8,7 @@ changes the waveform instead of cancelling out.
 
 from __future__ import annotations
 
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -20,6 +21,7 @@ import torch.nn.functional as F
 from sglang_omni.models.dots_tts.compat import import_dots_tts
 from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_convolutions
 from sglang_omni.models.dots_tts.vocoder import DotsTTSStreamingVocoder
+from sglang_omni.models.dots_tts.vocoder_conv_cache import ConvCacheDecoder
 from sglang_omni.models.dots_tts.vocoder_cuda_graph import (
     DotsVocoderGraphRunner,
     capture_device_graph,
@@ -32,6 +34,8 @@ import_dots_tts()
 from dots_tts.modules.backbone.layers import Conv1d, ConvTranspose1d
 from dots_tts.modules.vocoder.alias_free_filter import LowPassFilter1d
 from dots_tts.modules.vocoder.alias_free_resample import UpSample1d
+from dots_tts.modules.vocoder.bigvgan import Decoder
+from dots_tts.modules.vocoder.vocoder_inference import VocoderInference
 
 LATENT_DIM = 5
 HIDDEN = 8
@@ -43,6 +47,8 @@ NUM_SLOTS = 6
 MODEL_MAX_GENERATE_PATCHES = 500
 MODEL_PATCH_FRAMES = 4
 MODEL_HOP_SAMPLES = 1920
+
+logger = logging.getLogger(__name__)
 
 
 @pytest.mark.accelerator
@@ -403,7 +409,9 @@ def make_streaming_vocoder(
         device=device,
         hop_size=HOP,
     )
-    return DotsTTSStreamingVocoder(codec, **{"optimize": True, **kwargs})
+    return DotsTTSStreamingVocoder(
+        codec, **{"optimize": True, "enable_streaming_conv_cache": False, **kwargs}
+    )
 
 
 def test_step_graphs_can_be_disabled() -> None:
@@ -471,3 +479,335 @@ def test_capture_failure_aborts_pool_setup(
     with pytest.raises(RuntimeError, match="injected AudioVAE failure"):
         vocoder.ensure_slot_pool()
     assert vocoder.slot_pool is None
+
+
+class AttrDict(dict):
+    """Attribute access plus dict.get, matching the upstream vocoder config type."""
+
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+TINY_DECODER_CONFIG = AttrDict(
+    latent_dim=LATENT_DIM,
+    upsample_initial_channel=16,
+    upsample_rates=[2, 2],
+    upsample_kernel_sizes=[4, 4],
+    resblock="1",
+    resblock_kernel_sizes=[3, 7],
+    resblock_dilation_sizes=[(1, 2, 3), (1, 2, 3)],
+    activation="snakebeta",
+    snake_logscale=False,
+    causal=True,
+    use_tanh_at_final=False,
+)
+
+
+class TinyDecoderInference:
+    """Real tiny AudioVAE Decoder behind the streaming inference surface.
+
+    Weight sharing between the compared pools makes any structural mistake in
+    the incremental decoder (sequential resblocks, wrong cache length, wrong
+    slice) show up as a large step error, not a tolerance-level one.
+    """
+
+    def __init__(
+        self, device: torch.device, *, dtype: torch.dtype = torch.float32
+    ) -> None:
+        decoder = Decoder(TINY_DECODER_CONFIG).to(device=device, dtype=dtype).eval()
+        if device.type == "npu":
+            adapt_audio_vae_convolutions(decoder)
+        else:
+            pass
+        hop_size = 1
+        for rate in TINY_DECODER_CONFIG["upsample_rates"]:
+            hop_size *= int(rate)
+        self.vocoder = SimpleNamespace(decoder=decoder, hop_size=hop_size)
+        self.device = device
+        self.dtype = dtype
+        generator = torch.Generator().manual_seed(7)
+        self.drive = torch.rand(1, 1, HIDDEN, generator=generator).to(device)
+        self.lookahead = (int(decoder.conv_pre.kernel_size[0]) - 1) // 2
+        # note (codex): run the upstream left-context formula on a bare real
+        # instance so the window geometry never drifts from production.
+        probe = object.__new__(VocoderInference)
+        probe.vocoder = self.vocoder
+        self.left_context = int(
+            probe._decoder_stream_left_context()
+        )  # noqa: leading-underscore  # AudioVAE interface
+
+    def init_stream_state(self, *, batch_size: int, chunk_size: int):
+        window_frames = chunk_size + self.lookahead + self.left_context
+        window = torch.zeros(
+            batch_size,
+            LATENT_DIM,
+            window_frames,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        hidden = torch.zeros(1, batch_size, HIDDEN, device=self.device)
+        return SimpleNamespace(
+            lstm_hidden=(hidden, hidden.clone()),
+            decoder=SimpleNamespace(window=window, chunk_size=chunk_size),
+        )
+
+    def _decoder_stream_lookahead(
+        self,
+    ) -> int:  # noqa: leading-underscore  # AudioVAE interface
+        return self.lookahead
+
+    def _validate_stream_latents(
+        self, latents: torch.Tensor
+    ) -> None:  # noqa: leading-underscore  # AudioVAE interface
+        if latents.ndim != 3 or int(latents.shape[1]) != LATENT_DIM:
+            raise ValueError(f"bad latents {tuple(latents.shape)}")
+        else:
+            pass
+
+    def _decode_stream_latents(
+        self, latents, hidden
+    ):  # noqa: leading-underscore  # AudioVAE interface
+        hidden_h, hidden_c = hidden
+        drive = latents.float().mean(dim=(1, 2))
+        hidden_h = torch.tanh(hidden_h * 0.9 + drive[None, :, None] * self.drive)
+        hidden_c = hidden_c + latents.float().abs().mean(dim=(1, 2))[None, :, None]
+        gain = 1.0 + hidden_h.sum(dim=(0, 2))
+        decoder_input = (latents.float() * gain[:, None, None]).to(dtype=self.dtype)
+        return decoder_input, (hidden_h, hidden_c)
+
+    def _decode_stream_window(
+        self, window: torch.Tensor
+    ) -> torch.Tensor:  # noqa: leading-underscore  # AudioVAE interface
+        return self.vocoder.decoder(window.to(dtype=self.dtype)).float()
+
+    def _activation_left_context(
+        self, activation: torch.nn.Module
+    ) -> int:  # noqa: leading-underscore  # AudioVAE interface
+        return int(
+            VocoderInference._activation_left_context(activation)
+        )  # noqa: leading-underscore  # AudioVAE interface
+
+
+def conv_cache_scenario_steps(device: torch.device) -> list[dict[int, torch.Tensor]]:
+    # note (codex): Mixed row ages and irregular flush tails exercise cache seeding.
+    plan: list[tuple[tuple[int, ...], int]] = [((0,), 4), ((1,), 4), ((0, 1), 8)]
+    for step_index in range(29):
+        slots = (0, 1) if step_index % 4 else (0, 1, 2, 3)
+        plan.append((slots, 16))
+    plan.extend([((0, 1, 2), 12), ((1, 2, 3), 4), ((0, 1, 2, 3), 16)])
+    generator = torch.Generator().manual_seed(2024)
+    return [
+        {
+            slot: torch.randn(1, frames, LATENT_DIM, generator=generator).to(device)
+            for slot in slots
+        }
+        for slots, frames in plan
+    ]
+
+
+def run_pool_scenario(
+    pool: DotsVocoderSlotPool, steps: list[dict[int, torch.Tensor]]
+) -> list[dict[int, torch.Tensor]]:
+    for _ in range(4):
+        pool.acquire()
+    outputs = [pool.step(step) for step in steps]
+    outputs.append({slot: pool.flush(slot) for slot in range(4)})
+    device = steps[0][0].device
+    for slot in (0, 1):
+        pool.release(slot)
+    reused_slots = [pool.acquire(), pool.acquire()]
+    generator = torch.Generator().manual_seed(99)
+    for _ in range(3):
+        outputs.append(
+            pool.step(
+                {
+                    slot: torch.randn(1, 16, LATENT_DIM, generator=generator).to(device)
+                    for slot in reused_slots
+                }
+            )
+        )
+    outputs.append({slot: pool.flush(slot) for slot in reused_slots})
+    return outputs
+
+
+def assert_conv_cache_pair_matches(
+    reference: list[dict[int, torch.Tensor]],
+    actual: list[dict[int, torch.Tensor]],
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    assert len(reference) == len(actual)
+    max_error = 0.0
+    for step_index, (expected, candidate) in enumerate(
+        zip(reference, actual, strict=True)
+    ):
+        assert expected.keys() == candidate.keys()
+        for slot in expected:
+            expected_audio = expected[slot]
+            candidate_audio = candidate[slot]
+            assert int(expected_audio.shape[-1]) == int(candidate_audio.shape[-1]), (
+                f"step {step_index} slot {slot} length differs: "
+                f"{int(expected_audio.shape[-1])} vs {int(candidate_audio.shape[-1])}"
+            )
+            if expected_audio.numel():
+                max_error = max(
+                    max_error,
+                    float((expected_audio - candidate_audio).abs().max()),
+                )
+            else:
+                pass
+            torch.testing.assert_close(
+                candidate_audio,
+                expected_audio,
+                rtol=rtol,
+                atol=atol,
+                msg=lambda message: f"step {step_index} slot {slot}: {message}",
+            )
+    logger.info(f"conv-cache scenario max abs err: {max_error:.6e}")
+
+
+def run_window_cache_pair(
+    device: torch.device, *, dtype: torch.dtype
+) -> tuple[list[dict[int, torch.Tensor]], list[dict[int, torch.Tensor]]]:
+    inference = TinyDecoderInference(device, dtype=dtype)
+    steps = conv_cache_scenario_steps(device)
+    pair: list[list[dict[int, torch.Tensor]]] = []
+    for use_cache in (False, True):
+        pool = DotsVocoderSlotPool(
+            inference,
+            num_slots=NUM_SLOTS,
+            chunk_size=CHUNK,
+            latent_dim=LATENT_DIM,
+            conv_cache_decoder=(
+                ConvCacheDecoder(SimpleNamespace(inference=inference))
+                if use_cache
+                else None
+            ),
+        )
+        pair.append(run_pool_scenario(pool, steps))
+    return pair[0], pair[1]
+
+
+def test_conv_cache_matches_window_path_on_cpu() -> None:
+    reference, actual = run_window_cache_pair(torch.device("cpu"), dtype=torch.float32)
+    assert_conv_cache_pair_matches(reference, actual, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_conv_cache_matches_window_path_on_accelerator(
+    graph_device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    reference, actual = run_window_cache_pair(graph_device, dtype=dtype)
+    if dtype == torch.float16:
+        assert_conv_cache_pair_matches(reference, actual, rtol=2e-2, atol=2e-2)
+    else:
+        assert_conv_cache_pair_matches(reference, actual, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_conv_cache_graph_step_is_bit_identical_to_eager(
+    graph_device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    inference = TinyDecoderInference(graph_device, dtype=dtype)
+    steps = scenario_inputs(graph_device)
+    eager_pool = DotsVocoderSlotPool(
+        inference,
+        num_slots=NUM_SLOTS,
+        chunk_size=CHUNK,
+        latent_dim=LATENT_DIM,
+        conv_cache_decoder=ConvCacheDecoder(SimpleNamespace(inference=inference)),
+    )
+    reference = run_scenario(eager_pool, steps)
+
+    pool = DotsVocoderSlotPool(
+        inference,
+        num_slots=NUM_SLOTS,
+        chunk_size=CHUNK,
+        latent_dim=LATENT_DIM,
+        conv_cache_decoder=ConvCacheDecoder(SimpleNamespace(inference=inference)),
+    )
+    runner = DotsVocoderGraphRunner(
+        forward=pool.forward_conv_cache,
+        new_inputs=pool.new_conv_cache_step_inputs,
+        device=pool.device,
+    )
+    runner.capture(ALL_KEYS)
+    pool.conv_cache_graph_runner = runner
+    actual = run_scenario(pool, steps)
+    assert_same_outputs(reference, actual)
+    # note (codex): rows below warmup_frames take the eager window path, so only
+    # steps that start with at least one hot row replay a conv-cache graph.
+    assert pool.conv_cache_decoder is not None
+    warmup = pool.conv_cache_decoder.warmup_frames
+    totals: dict[int, int] = {}
+    hot_steps = 0
+    for slots, frames in SCENARIO:
+        if any(totals.get(slot, 0) >= warmup for slot in slots):
+            hot_steps += 1
+        else:
+            pass
+        for slot in slots:
+            totals[slot] = totals.get(slot, 0) + frames
+    assert 0 < hot_steps < len(SCENARIO)
+    assert runner.replays == hot_steps
+    assert runner.misses == 0
+
+
+@pytest.mark.accelerator
+def test_conv_cache_wiring_keeps_window_graphs_for_warmup(
+    graph_device: torch.device,
+) -> None:
+    if graph_device.type != "npu":
+        pytest.skip("conv cache is enabled on NPU only")
+    else:
+        pass
+    codec = SimpleNamespace(
+        inference=TinyDecoderInference(graph_device),
+        lock=threading.RLock(),
+        sample_rate=48000,
+        patch_size=PATCH,
+        latent_dim=LATENT_DIM,
+        device=graph_device,
+        hop_size=HOP,
+    )
+    vocoder = DotsTTSStreamingVocoder(codec, optimize=True)
+    pool = vocoder.ensure_slot_pool()
+    assert pool.conv_cache_decoder is not None
+    assert pool.conv_cache_graph_runner is not None
+    assert pool.conv_cache_graph_runner.captured_keys == ALL_KEYS
+    # note (codex): pre-warmup rows still take the window path, so its graphs
+    # stay wired exactly like the no-conv-cache pool.
+    assert pool.graph_runner is not None
+    assert pool.graph_runner.captured_keys == ALL_KEYS
+    reference_pool = DotsTTSStreamingVocoder(
+        codec, optimize=True, enable_streaming_conv_cache=False
+    ).ensure_slot_pool()
+    assert (
+        pool.prefix_graph_runners.keys() == reference_pool.prefix_graph_runners.keys()
+    )
+    for decoder_frames, prefix_runner in pool.prefix_graph_runners.items():
+        assert (
+            prefix_runner.captured_keys
+            == reference_pool.prefix_graph_runners[decoder_frames].captured_keys
+        )
+    assert vocoder.cuda_graph_count == len(ALL_KEYS) * 2 + sum(
+        len(prefix_runner.captured_keys)
+        for prefix_runner in reference_pool.prefix_graph_runners.values()
+    )
+
+
+def test_conv_cache_stays_off_acceleratorless_devices() -> None:
+    vocoder = make_streaming_vocoder(
+        torch.device("cpu"), enable_streaming_conv_cache=True
+    )
+    pool = vocoder.ensure_slot_pool()
+    assert pool.conv_cache_decoder is None
+    assert pool.conv_cache_graph_runner is None

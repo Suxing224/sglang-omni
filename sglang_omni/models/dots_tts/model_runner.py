@@ -334,11 +334,19 @@ class DotsTTSModelRunner(ModelRunner[DotsTTSSGLangRequestData]):
             else:
                 pass
             next_token_ids.append(data.control_token_id)
-        result.next_token_ids = torch.tensor(
-            next_token_ids,
-            dtype=torch.long,
-            device=hidden.device,
-        )
+        if hidden.device.type == "npu":
+            result.next_token_ids = torch.tensor(
+                next_token_ids,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=True,
+            ).to(hidden.device, non_blocking=True)
+        else:
+            result.next_token_ids = torch.tensor(
+                next_token_ids,
+                dtype=torch.long,
+                device=hidden.device,
+            )
         return DotsFlowLaunchBuf(
             data_rows=data_rows,
             steps=steps,

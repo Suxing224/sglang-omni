@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -11,6 +12,7 @@ import torch
 
 from sglang_omni.models.dots_tts.codec import DotsAudioCodec
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState, load_dots_tts_state
+from sglang_omni.models.dots_tts.vocoder_conv_cache import ConvCacheDecoder
 from sglang_omni.models.dots_tts.vocoder_cuda_graph import DotsVocoderGraphRunner
 from sglang_omni.models.dots_tts.vocoder_slot_pool import DotsVocoderSlotPool
 from sglang_omni.proto import StagePayload
@@ -156,6 +158,7 @@ class DotsStreamState:
     slot: int | None = None
     pending: list[torch.Tensor] = field(default_factory=list)
     received_patches: int = 0
+    ready_since_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,10 +181,13 @@ class DotsTTSStreamingVocoder(
         *,
         optimize: bool,
         enable_streaming_audio_vae_cuda_graph: bool = True,
+        enable_streaming_conv_cache: bool = True,
         merge_steps: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
         stream_slots: int = 16,
+        stream_chunk_batch_max: int | None = None,
+        stream_group_wait_ms: float = 0.0,
         slot_pool: DotsVocoderSlotPool | None = None,
     ) -> None:
         if merge_steps < 1:
@@ -200,6 +206,16 @@ class DotsTTSStreamingVocoder(
             raise ValueError("dots.tts vocoder stream_slots must be positive")
         else:
             pass
+        if stream_chunk_batch_max is not None and stream_chunk_batch_max < 1:
+            raise ValueError("dots.tts vocoder stream_chunk_batch_max must be positive")
+        else:
+            pass
+        if stream_group_wait_ms < 0:
+            raise ValueError(
+                "dots.tts vocoder stream_group_wait_ms must be non-negative"
+            )
+        else:
+            pass
         self.codec = codec
         self.optimize = bool(optimize)
         self.merge_steps = int(merge_steps) if optimize else 1
@@ -207,11 +223,20 @@ class DotsTTSStreamingVocoder(
         self.enable_streaming_audio_vae_cuda_graph = bool(
             enable_streaming_audio_vae_cuda_graph
         )
+        self.enable_streaming_conv_cache = bool(enable_streaming_conv_cache)
         self.batch_vocoder = DotsTTSBatchVocoder(codec)
         self.slot_pool = slot_pool
         # note (guozhihao-224): coalesce width follows max_batch_size only;
         # stream_slots is admission capacity and must not redefine the batch cap.
-        self.stream_chunk_batch_max = int(max_batch_size)
+        # stream_chunk_batch_max overrides the streaming cap alone so widening the
+        # coalesce never changes the non-streaming batch path.
+        self.stream_chunk_batch_max = (
+            int(max_batch_size)
+            if stream_chunk_batch_max is None
+            else int(stream_chunk_batch_max)
+        )
+        # note (codex): Small groups become eligible after this coalescing delay.
+        self.stream_group_wait_ms = float(stream_group_wait_ms)
         super().__init__(
             self.batch_vocoder.decode_payload,
             batch_compute_fn=self.batch_vocoder.decode_payloads,
@@ -264,6 +289,10 @@ class DotsTTSStreamingVocoder(
         state.pending.append(codes)
         state.received_patches += 1
         self.ensure_slot(state)
+        if state.ready_since_ns is None and self.pending_ready(state):
+            state.ready_since_ns = time.perf_counter_ns()
+        else:
+            pass
 
     def should_decode(self, state: DotsStreamState, *, is_final: bool) -> bool:
         # note (guozhihao-224): coalesced serving uses select_step_participants;
@@ -294,16 +323,23 @@ class DotsTTSStreamingVocoder(
             else:
                 pass
             if state.slot is not None and state.pending:
-                take = len(state.pending)
-                patches, state.pending = state.pending[:take], state.pending[take:]
-                # note (db-ol): compiled stream_step cudagraph trees corrupt the
-                # backbone decode graph replay in this process, see issue 1392;
-                # the slot pool stays on the eager kernels (#1395).
-                chunk = pool.step({state.slot: torch.cat(patches, dim=1)})[state.slot]
-                if chunk.numel():
-                    chunks.append(chunk)
-                else:
-                    pass
+                # note (codex): drain in merge_steps pieces like the coalesced
+                # pump does; group-wait deferral lets pending grow past one
+                # window (step length must stay < window size), so a single
+                # take-all step is not always legal.
+                while state.pending:
+                    take = min(self.merge_steps, len(state.pending))
+                    patches, state.pending = state.pending[:take], state.pending[take:]
+                    # note (db-ol): compiled stream_step cudagraph trees corrupt the
+                    # backbone decode graph replay in this process, see issue 1392;
+                    # the slot pool stays on the eager kernels (#1395).
+                    chunk = pool.step({state.slot: torch.cat(patches, dim=1)})[
+                        state.slot
+                    ]
+                    if chunk.numel():
+                        chunks.append(chunk)
+                    else:
+                        pass
             else:
                 pass
             if state.slot is not None:
@@ -379,7 +415,27 @@ class DotsTTSStreamingVocoder(
         for entry in slotted:
             frames = self.step_frames(entry[1])
             by_frames.setdefault(frames, []).append(entry)
-        return max(by_frames.values(), key=len)[: self.stream_chunk_batch_max]
+        wait_ns = int(self.stream_group_wait_ms * 1e6)
+        now = time.perf_counter_ns()
+        eligible: list[list[tuple[str, DotsStreamState]]] = []
+        for entries in by_frames.values():
+            if len(entries) >= self.stream_chunk_batch_max:
+                eligible.append(entries)
+                continue
+            else:
+                pass
+            if any(
+                state.ready_since_ns is None or now - state.ready_since_ns >= wait_ns
+                for _, state in entries
+            ):
+                eligible.append(entries)
+            else:
+                pass
+        if not eligible:
+            return []
+        else:
+            pass
+        return max(eligible, key=len)[: self.stream_chunk_batch_max]
 
     def build_step_plan(
         self, participants: list[tuple[str, DotsStreamState]]
@@ -421,6 +477,10 @@ class DotsTTSStreamingVocoder(
         out: dict[str, torch.Tensor] = {}
         for request_id, state in participants:
             del state.pending[: plan.take_patches]
+            if not self.pending_ready(state):
+                state.ready_since_ns = None
+            else:
+                pass
             if state.slot is None:
                 continue
             else:
@@ -435,17 +495,38 @@ class DotsTTSStreamingVocoder(
     def get_or_create_pool_locked(self) -> DotsVocoderSlotPool:
         # Caller must hold self.codec.lock (RLock).
         if self.slot_pool is None:
+            # note (codex): the conv-cache decoder only pays off where the
+            # full-window step is the pacer; other devices keep the window path.
+            use_conv_cache = (
+                self.optimize
+                and self.enable_streaming_conv_cache
+                and self.codec.device.type == "npu"
+            )
             pool = DotsVocoderSlotPool(
                 self.codec.inference,
                 num_slots=self.stream_slots,
                 chunk_size=self.codec.patch_size * self.merge_steps,
                 latent_dim=self.codec.latent_dim,
+                conv_cache_decoder=(
+                    ConvCacheDecoder(self.codec) if use_conv_cache else None
+                ),
             )
-            pool.graph_runner = (
-                self.capture_step_graphs(pool)
-                if self.enable_streaming_audio_vae_cuda_graph
+            capture_graphs = (
+                self.enable_streaming_audio_vae_cuda_graph
                 and pool.device.type in {"cuda", "npu"}
-                else None
+            )
+            if pool.conv_cache_decoder is not None:
+                pool.conv_cache_graph_runner = (
+                    self.capture_conv_cache_step_graphs(pool)
+                    if capture_graphs
+                    else None
+                )
+            else:
+                pass
+            # note (codex): rows below warmup_frames still take the window path
+            # on the conv-cache pool, so the window graphs stay wired either way.
+            pool.graph_runner = (
+                self.capture_step_graphs(pool) if capture_graphs else None
             )
             if pool.device.type == "npu" and pool.graph_runner is not None:
                 patch_frames = self.codec.patch_size
@@ -471,7 +552,8 @@ class DotsTTSStreamingVocoder(
             logger.info(
                 f"dots.tts streaming vocoder slot pool ready: "
                 f"slots={self.stream_slots} merge_steps={self.merge_steps} "
-                f"chunk_size={self.codec.patch_size * self.merge_steps}"
+                f"chunk_size={self.codec.patch_size * self.merge_steps} "
+                f"conv_cache={pool.conv_cache_decoder is not None}"
             )
         else:
             pass
@@ -502,6 +584,18 @@ class DotsTTSStreamingVocoder(
         runner.capture(capture_keys)
         return runner
 
+    def capture_conv_cache_step_graphs(
+        self,
+        pool: DotsVocoderSlotPool,
+    ) -> DotsVocoderGraphRunner:
+        runner = DotsVocoderGraphRunner(
+            forward=pool.forward_conv_cache,
+            new_inputs=pool.new_conv_cache_step_inputs,
+            device=pool.device,
+        )
+        runner.capture(self.cuda_graph_capture_keys())
+        return runner
+
     def cuda_graph_capture_keys(self) -> list[tuple[int, int]]:
         # note (lennox): only single-request final drains use intermediate lengths.
         return [
@@ -515,14 +609,29 @@ class DotsTTSStreamingVocoder(
 
     @property
     def cuda_graph_count(self) -> int:
-        runner = None if self.slot_pool is None else self.slot_pool.graph_runner
-        if runner is None:
+        pool = self.slot_pool
+        if pool is None:
             return 0
         else:
-            return len(runner.captured_keys) + sum(
+            pass
+        count = 0
+        if pool.conv_cache_graph_runner is not None:
+            count += len(pool.conv_cache_graph_runner.captured_keys)
+        else:
+            pass
+        runner = pool.graph_runner
+        if runner is None:
+            return count
+        else:
+            pass
+        return (
+            count
+            + len(runner.captured_keys)
+            + sum(
                 len(prefix_runner.captured_keys)
-                for prefix_runner in self.slot_pool.prefix_graph_runners.values()
+                for prefix_runner in pool.prefix_graph_runners.values()
             )
+        )
 
     def ensure_slot(self, state: DotsStreamState) -> None:
         if state.slot is not None:

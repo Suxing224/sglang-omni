@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang_omni.models.dots_tts.vocoder_conv_cache import ConvCacheDecoder
 from sglang_omni.models.dots_tts.vocoder_cuda_graph import DotsVocoderGraphRunner
 
 if TYPE_CHECKING:
@@ -92,6 +93,7 @@ class DotsVocoderSlotPool:
         num_slots: int,
         chunk_size: int,
         latent_dim: int,
+        conv_cache_decoder: ConvCacheDecoder | None = None,
     ) -> None:
         if num_slots < 1:
             raise ValueError(f"num_slots must be >= 1, got {num_slots}")
@@ -104,6 +106,8 @@ class DotsVocoderSlotPool:
         self.inference = inference
         self.graph_runner: DotsVocoderGraphRunner | None = None
         self.prefix_graph_runners: dict[int, DotsVocoderGraphRunner] = {}
+        self.conv_cache_decoder = conv_cache_decoder
+        self.conv_cache_graph_runner: DotsVocoderGraphRunner | None = None
         self.num_slots = int(num_slots)
         self.chunk_size = int(chunk_size)
         # note (guozhihao-224): probe shapes through the public stream-state
@@ -122,6 +126,12 @@ class DotsVocoderSlotPool:
         self.lstm_h = hidden_h.new_zeros(int(layers), self.num_slots, int(hidden))
         self.lstm_c = hidden_c.new_zeros(int(layers), self.num_slots, int(hidden))
         self.window = window.new_zeros(self.num_slots, int(channels), self.window_size)
+        if self.conv_cache_decoder is None:
+            self.conv_cache_flat: torch.Tensor | None = None
+        else:
+            self.conv_cache_flat = self.conv_cache_decoder.new_cache_buffer(
+                self.num_slots
+            )
         self.total_frames = [0] * self.num_slots
         self.emitted_frames = [0] * self.num_slots
         self.free_slots = list(reversed(range(self.num_slots)))
@@ -150,6 +160,21 @@ class DotsVocoderSlotPool:
                 device=self.device,
             ),
             torch.zeros(batch, dtype=torch.int64, device=self.device),
+        )
+
+    def new_conv_cache_step_inputs(
+        self, batch: int, frames: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(packed, hidden_h, hidden_c, flat_cache) input layout."""
+        assert self.conv_cache_decoder is not None
+        assert self.conv_cache_flat is not None
+        layers, _, hidden = self.lstm_h.shape
+        lstm_kwargs = {"dtype": self.lstm_h.dtype, "device": self.device}
+        return (
+            torch.zeros(batch, self.latent_dim, frames, **lstm_kwargs),
+            torch.zeros(layers, batch, hidden, **lstm_kwargs),
+            torch.zeros(layers, batch, hidden, **lstm_kwargs),
+            self.conv_cache_decoder.new_cache_buffer(batch),
         )
 
     def acquire(self) -> int:
@@ -240,6 +265,19 @@ class DotsVocoderSlotPool:
         self.inference._validate_stream_latents(
             packed
         )  # noqa: leading-underscore  # AudioVAE API spelling
+        if self.conv_cache_decoder is not None:
+            return self.step_mixed(
+                slots,
+                slot_index,
+                packed,
+                hidden_h,
+                hidden_c,
+                window,
+                valid,
+                step_t,
+            )
+        else:
+            pass
         graph_runner = self.graph_runner
         required_frames = max(self.total_frames[slot] + step_t for slot in slots)
         for decoder_frames, prefix_runner in sorted(self.prefix_graph_runners.items()):
@@ -254,7 +292,7 @@ class DotsVocoderSlotPool:
         replayed = (
             None
             if graph_runner is None
-            else graph_runner.run(packed, hidden_h, hidden_c, window, valid)
+            else graph_runner.run((packed, hidden_h, hidden_c, window, valid))
         )
         audio_window, hidden_h, hidden_c, new_window = (
             self.forward(packed, hidden_h, hidden_c, window, valid)
@@ -269,6 +307,156 @@ class DotsVocoderSlotPool:
         for row, slot in enumerate(slots):
             self.total_frames[slot] += step_t
             out[slot] = self.slice_audio(slot, audio_window[row : row + 1], final=False)
+        return out
+
+    @torch.no_grad()
+    def step_mixed(
+        self,
+        slots: list[int],
+        slot_index: torch.Tensor,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        window: torch.Tensor,
+        valid: torch.Tensor,
+        step_frames: int,
+    ) -> dict[int, torch.Tensor]:
+        """Warm rows take the window path; hot rows take the conv-cache path.
+
+        Zero-initialized caches replay the window mask's boundary zeros at every
+        layer except the replicate-padded activations, so rows younger than
+        warmup_frames stay on the reference window path. The step that crosses
+        the threshold runs an eager hooked window decode and seeds the flat
+        cache from the captured layer inputs; from the next step on the row
+        joins the conv-cache batch bit-identically.
+        """
+        assert self.conv_cache_decoder is not None
+        warmup = self.conv_cache_decoder.warmup_frames
+        warm_rows = [
+            row for row, slot in enumerate(slots) if self.total_frames[slot] < warmup
+        ]
+        hot_rows = [
+            row for row, slot in enumerate(slots) if self.total_frames[slot] >= warmup
+        ]
+        out: dict[int, torch.Tensor] = {}
+        if hot_rows:
+            row_index = torch.tensor(
+                hot_rows, device=slot_index.device, dtype=torch.long
+            )
+            out.update(
+                self.step_conv_cache(
+                    [slots[row] for row in hot_rows],
+                    slot_index[row_index],
+                    packed[row_index],
+                    hidden_h[:, row_index],
+                    hidden_c[:, row_index],
+                    step_frames,
+                )
+            )
+        else:
+            pass
+        if warm_rows:
+            row_index = torch.tensor(
+                warm_rows, device=slot_index.device, dtype=torch.long
+            )
+            out.update(
+                self.step_warm(
+                    [slots[row] for row in warm_rows],
+                    slot_index[row_index],
+                    packed[row_index],
+                    hidden_h[:, row_index],
+                    hidden_c[:, row_index],
+                    window[row_index],
+                    valid[row_index],
+                    step_frames,
+                )
+            )
+        else:
+            pass
+        return out
+
+    @torch.no_grad()
+    def step_warm(
+        self,
+        slots: list[int],
+        slot_index: torch.Tensor,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        window: torch.Tensor,
+        valid: torch.Tensor,
+        step_frames: int,
+    ) -> dict[int, torch.Tensor]:
+        """Window-path step for pre-warmup rows, seeding rows that cross."""
+        assert self.conv_cache_decoder is not None
+        assert self.conv_cache_flat is not None
+        warmup = self.conv_cache_decoder.warmup_frames
+        crossing = any(
+            self.total_frames[slot] + step_frames >= warmup for slot in slots
+        )
+        captured: dict[int, torch.Tensor] | None = None
+        if crossing:
+            # note (codex): hooks only fire in eager mode; a crossing step pays
+            # one eager window decode per stream and the captured layer inputs
+            # seed the flat cache for the conv-cache steps that follow. The
+            # decode trims to the rows' valid frames (same geometry as the
+            # prefix graphs), so the one-time cost scales with warmup + step,
+            # not the full window.
+            decoder_frames = max(
+                min(self.total_frames[slot] + step_frames, self.window_size)
+                for slot in slots
+            )
+            with self.conv_cache_decoder.capture_spec_inputs() as hooked:
+                audio_window, hidden_h, hidden_c, new_window = self.forward(
+                    packed,
+                    hidden_h,
+                    hidden_c,
+                    window,
+                    valid,
+                    decoder_window_frames=decoder_frames,
+                )
+            captured = hooked
+        else:
+            graph_runner = self.graph_runner
+            required_frames = max(
+                self.total_frames[slot] + step_frames for slot in slots
+            )
+            for decoder_frames, prefix_runner in sorted(
+                self.prefix_graph_runners.items()
+            ):
+                if (
+                    required_frames <= decoder_frames
+                    and (len(slots), step_frames) in prefix_runner.captured_keys
+                ):
+                    graph_runner = prefix_runner
+                    break
+                else:
+                    pass
+            replayed = (
+                None
+                if graph_runner is None
+                else graph_runner.run((packed, hidden_h, hidden_c, window, valid))
+            )
+            audio_window, hidden_h, hidden_c, new_window = (
+                self.forward(packed, hidden_h, hidden_c, window, valid)
+                if replayed is None
+                else replayed
+            )
+        self.lstm_h[:, slot_index, :] = hidden_h
+        self.lstm_c[:, slot_index, :] = hidden_c
+        self.window[slot_index] = new_window
+        out: dict[int, torch.Tensor] = {}
+        for row, slot in enumerate(slots):
+            self.total_frames[slot] += step_frames
+            out[slot] = self.slice_audio(slot, audio_window[row : row + 1], final=False)
+            if self.total_frames[slot] >= warmup:
+                assert captured is not None
+                valid_frames = min(self.total_frames[slot], self.window_size)
+                self.conv_cache_decoder.seed_from_captured(
+                    self.conv_cache_flat[slot], captured, row, valid_frames
+                )
+            else:
+                pass
         return out
 
     @torch.no_grad()
@@ -305,10 +493,95 @@ class DotsVocoderSlotPool:
         return audio_window, hidden_h, hidden_c, new_window
 
     @torch.no_grad()
+    def forward_conv_cache(
+        self,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        flat_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # note (lennox): device-graph capture boundary; keep slot bookkeeping and
+        # anything host-side out of it.
+        assert self.conv_cache_decoder is not None
+        decoder_input, (hidden_h, hidden_c) = (
+            self.inference._decode_stream_latents(  # noqa: leading-underscore  # AudioVAE API spelling
+                packed, (hidden_h, hidden_c)
+            )
+        )
+        audio, new_flat_cache = self.conv_cache_decoder.decode_segment(
+            decoder_input, flat_cache
+        )
+        return audio, hidden_h, hidden_c, new_flat_cache
+
+    @torch.no_grad()
+    def step_conv_cache(
+        self,
+        slots: list[int],
+        slot_index: torch.Tensor,
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        step_frames: int,
+    ) -> dict[int, torch.Tensor]:
+        """Conv-cache step: slot rows share one batched incremental decode.
+
+        Rows are always past warmup_frames (younger rows take step_warm), so
+        every cache row is seeded from a hooked window decode. Each row returns
+        its stable tail: the cache decoder reproduces the window path segment
+        for [total - step - lookahead, total - lookahead), and per-slot emitted
+        counters select the unseen suffix of it.
+        """
+        assert self.conv_cache_decoder is not None
+        assert self.conv_cache_flat is not None
+        flat_cache = self.conv_cache_flat.index_select(0, slot_index).contiguous()
+        graph_runner = self.conv_cache_graph_runner
+        replayed = (
+            None
+            if graph_runner is None
+            else graph_runner.run((packed, hidden_h, hidden_c, flat_cache))
+        )
+        audio, hidden_h, hidden_c, new_flat_cache = (
+            self.forward_conv_cache(packed, hidden_h, hidden_c, flat_cache)
+            if replayed is None
+            else replayed
+        )
+        self.lstm_h[:, slot_index, :] = hidden_h
+        self.lstm_c[:, slot_index, :] = hidden_c
+        self.conv_cache_flat[slot_index] = new_flat_cache
+        out: dict[int, torch.Tensor] = {}
+        for row, slot in enumerate(slots):
+            self.total_frames[slot] += step_frames
+            stable_end = max(0, self.total_frames[slot] - self.lookahead)
+            emit_frames = stable_end - self.emitted_frames[slot]
+            if emit_frames <= 0:
+                out[slot] = audio.new_zeros((1, 1, 0))
+            else:
+                if emit_frames > step_frames:
+                    raise RuntimeError(
+                        "dots.tts conv-cache step emission exceeds the step length: "
+                        f"slot {slot} emits {emit_frames} frames from a "
+                        f"{step_frames}-frame step"
+                    )
+                else:
+                    pass
+                out[slot] = audio[
+                    row : row + 1, :, (step_frames - emit_frames) * self.hop_size :
+                ]
+                self.emitted_frames[slot] = stable_end
+        return out
+
+    @torch.no_grad()
     def flush(self, slot: int) -> torch.Tensor:
         slot = int(slot)
         if slot not in self.in_use:
             raise RuntimeError(f"dots.tts streaming flush referenced free slot {slot}")
+        else:
+            pass
+        if (
+            self.conv_cache_decoder is not None
+            and self.total_frames[slot] >= self.conv_cache_decoder.warmup_frames
+        ):
+            return self.flush_conv_cache(slot)
         else:
             pass
         audio_window = self.inference._decode_stream_window(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -316,10 +589,38 @@ class DotsVocoderSlotPool:
         )
         return self.slice_audio(slot, audio_window, final=True)
 
+    @torch.no_grad()
+    def flush_conv_cache(self, slot: int) -> torch.Tensor:
+        """Drain the lookahead tail: zero frames play the window right zero-pad."""
+        assert self.conv_cache_decoder is not None
+        assert self.conv_cache_flat is not None
+        total = self.total_frames[slot]
+        emit_frames = total - self.emitted_frames[slot]
+        if emit_frames <= 0:
+            return torch.zeros(1, 1, 0, dtype=torch.float32, device=self.device)
+        else:
+            pass
+        zero_latents = self.conv_cache_flat.new_zeros(
+            1,
+            int(self.conv_cache_decoder.decoder.conv_pre.in_channels),
+            self.lookahead,
+        )
+        audio, new_flat_cache = self.conv_cache_decoder.decode_segment(
+            zero_latents,
+            self.conv_cache_flat[slot : slot + 1],
+        )
+        self.conv_cache_flat[slot : slot + 1] = new_flat_cache
+        self.emitted_frames[slot] = total
+        return audio[..., (self.lookahead - emit_frames) * self.hop_size :]
+
     def reset_slot(self, slot: int) -> None:
         self.lstm_h[:, slot].zero_()
         self.lstm_c[:, slot].zero_()
         self.window[slot].zero_()
+        if self.conv_cache_flat is not None:
+            self.conv_cache_flat[slot].zero_()
+        else:
+            pass
         self.total_frames[slot] = 0
         self.emitted_frames[slot] = 0
 
