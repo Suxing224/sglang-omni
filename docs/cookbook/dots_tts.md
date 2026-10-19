@@ -109,6 +109,10 @@ generation, and waveform decoding. It enables 16 acoustic slots, a maximum of
 streaming-vocoder device graphs. Backbone attention uses Ascend, sampling uses
 PyTorch, and the backbone KV cache is 2 GiB.
 
+The NPU configuration also enables streaming convolution caching. Set
+`stages.vocoder.factory.enable_streaming_conv_cache: false` to use the
+window decoder for every streaming step.
+
 Keep reference encoding and waveform decoding in separate processes: reference
 encoding sets npu_convolution_allow_hf32 to false, and the AudioVAE adapter
 disables NPU internal formats before graph capture. These SDK settings are
