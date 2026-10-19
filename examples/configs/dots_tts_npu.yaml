@@ -46,7 +46,7 @@ stages:
     factory:
       optimize: true
       enable_streaming_audio_vae_cuda_graph: true
-      enable_streaming_conv_cache: true
+      enable_streaming_conv_cache: false
       max_batch_size: 4
       max_batch_wait_ms: 2
       stream_group_wait_ms: 150

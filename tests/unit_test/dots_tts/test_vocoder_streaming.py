@@ -199,6 +199,21 @@ def test_streaming_coalesces_equal_t_requests_into_one_pool_step() -> None:
     assert set(decoded) == {"a", "b"}
 
 
+def test_streaming_conv_cache_is_opt_in() -> None:
+    codec = make_codec()
+    codec.device = torch.device("npu")
+    vocoder = DotsTTSStreamingVocoder(
+        codec,
+        optimize=True,
+        enable_streaming_audio_vae_cuda_graph=False,
+    )
+    pool = vocoder.ensure_slot_pool()
+
+    assert vocoder.enable_streaming_conv_cache is False
+    assert pool.conv_cache_decoder is None
+    assert pool.conv_cache_graph_runner is None
+
+
 def test_select_step_participants_respects_max_batch_size() -> None:
     pool = RecordingSlotPool(num_slots=8)
     vocoder = DotsTTSStreamingVocoder(

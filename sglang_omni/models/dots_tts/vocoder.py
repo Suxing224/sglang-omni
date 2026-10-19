@@ -181,7 +181,7 @@ class DotsTTSStreamingVocoder(
         *,
         optimize: bool,
         enable_streaming_audio_vae_cuda_graph: bool = True,
-        enable_streaming_conv_cache: bool = True,
+        enable_streaming_conv_cache: bool = False,
         merge_steps: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,

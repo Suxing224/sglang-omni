@@ -778,7 +778,9 @@ def test_conv_cache_wiring_keeps_window_graphs_for_warmup(
         device=graph_device,
         hop_size=HOP,
     )
-    vocoder = DotsTTSStreamingVocoder(codec, optimize=True)
+    vocoder = DotsTTSStreamingVocoder(
+        codec, optimize=True, enable_streaming_conv_cache=True
+    )
     pool = vocoder.ensure_slot_pool()
     assert pool.conv_cache_decoder is not None
     assert pool.conv_cache_graph_runner is not None

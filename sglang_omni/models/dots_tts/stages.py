@@ -535,7 +535,7 @@ def create_vocoder_executor(
     gpu_id: int | None = None,
     optimize: bool = True,
     enable_streaming_audio_vae_cuda_graph: bool = True,
-    enable_streaming_conv_cache: bool = True,
+    enable_streaming_conv_cache: bool = False,
     vocoder_merge_steps: int = 4,
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
