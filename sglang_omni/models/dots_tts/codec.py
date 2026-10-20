@@ -24,6 +24,7 @@ from sglang_omni.models.dots_tts.payload_types import (
     load_dots_tts_state,
     store_dots_tts_state,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.preprocessing.cache_key import (
     hash_media_item,
     reference_path_cache_key,
@@ -71,7 +72,13 @@ class DotsAudioCodec:
         load_module(vocoder, root / "vocoder.safetensors")
         load_module(speaker, root / "speaker_encoder.safetensors")
         self.vocoder = vocoder.to(device=torch.device(device)).eval()
-        if torch.device(device).type == "npu":
+        if (
+            current_platform.is_npu()
+            and current_platform.get_device_graph_backend(
+                self.vocoder.post_proj.weight.device
+            )
+            is not None
+        ):
             adapt_audio_vae_convolutions(self.vocoder.post_proj)
             adapt_audio_vae_convolutions(self.vocoder.decoder)
         else:

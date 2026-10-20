@@ -217,8 +217,7 @@ def test_invalid_latents_are_rejected(latents: torch.Tensor, message: str) -> No
 def test_streaming_vocoder_enables_payload_and_chunk_batching() -> None:
     codec = make_codec()
     scheduler = DotsTTSStreamingVocoder(
-        codec,
-        optimize=False,
+        codec, optimize=False, enable_streaming_fast_start=True
     )
 
     assert scheduler.batch_fn is not None
@@ -236,7 +235,9 @@ def test_streaming_vocoder_enables_payload_and_chunk_batching() -> None:
 
 def test_non_streaming_batch_isolates_invalid_payload() -> None:
     codec = make_codec()
-    scheduler = DotsTTSStreamingVocoder(codec, optimize=False)
+    scheduler = DotsTTSStreamingVocoder(
+        codec, optimize=False, enable_streaming_fast_start=True
+    )
     invalid = payload("bad", 16, 2)
     invalid.data["generated_latents"] = torch.zeros(2, 4, 3)
 
@@ -267,7 +268,9 @@ def test_non_streaming_batch_isolates_invalid_payload() -> None:
 )
 def test_invalid_batch_config_is_rejected(kwargs: dict, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        DotsTTSStreamingVocoder(make_codec(), optimize=False, **kwargs)
+        DotsTTSStreamingVocoder(
+            make_codec(), optimize=False, **kwargs, enable_streaming_fast_start=True
+        )
 
 
 class TestVocoderFactorySignature:

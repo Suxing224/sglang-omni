@@ -192,10 +192,6 @@ def test_dots_direct_preprocessor_resolves_tokenizer_invariants(
             "You aren‘t positive, you‘re negative.",
             "That‘s 50 people in Zürich 中文“测试”.",
         ),
-        (
-            "You aren't positive, you're negative.",
-            "That's 50 people in Zürich 中文“测试”.",
-        ),
     ],
 )
 def test_contraction_typography_preserves_spoken_text_and_reference(

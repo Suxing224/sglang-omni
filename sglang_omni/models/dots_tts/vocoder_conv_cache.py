@@ -145,11 +145,7 @@ class ConvCacheDecoder:
         self.specs = specs
         self.flat_size = int(offset)
         self.use_tanh = bool(decoder.h.get("use_tanh_at_final", True))
-        # note (codex): seeding a layer's cache needs valid_frames - lookahead
-        # output frames at its input rate to cover its left tail (the pre layer
-        # spans 2 * lookahead latent frames before any shift). warmup_frames is
-        # the smallest valid count that fills every cache row from one hooked
-        # window decode; younger rows stay on the window path.
+        # note (codex): Seed only when the window fills every layer's left context.
         rate = 1
         margin = 2 * self.lookahead
         for spec in specs:

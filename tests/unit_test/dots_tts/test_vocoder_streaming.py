@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from queue import Empty
 from types import SimpleNamespace
 
 import pytest
@@ -178,6 +179,7 @@ def test_streaming_coalesces_equal_t_requests_into_one_pool_step() -> None:
         max_batch_size=4,
         stream_slots=4,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     assert vocoder.can_batch_stream_chunks is True
     assert vocoder.stream_chunk_batch_max == 4
@@ -206,12 +208,71 @@ def test_streaming_conv_cache_is_opt_in() -> None:
         codec,
         optimize=True,
         enable_streaming_audio_vae_cuda_graph=False,
+        enable_streaming_fast_start=True,
     )
     pool = vocoder.ensure_slot_pool()
 
     assert vocoder.enable_streaming_conv_cache is False
     assert pool.conv_cache_decoder is None
     assert pool.conv_cache_graph_runner is None
+
+
+@pytest.mark.parametrize("enable_fast_start", [True, False])
+def test_startup_batching_preserves_fast_start_choice(enable_fast_start: bool) -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(patch_size=4),
+        optimize=True,
+        enable_streaming_fast_start=enable_fast_start,
+        merge_steps=4,
+        slot_pool=pool,
+    )
+    state = vocoder.create_stream_state("startup")
+    vocoder.stream_states["startup"] = state
+    for chunk_index in range(4):
+        vocoder.on_stream_chunk_batch(
+            [
+                (
+                    "startup",
+                    StreamItem(
+                        chunk_id=chunk_index,
+                        data=torch.full((1, 4, 5), float(chunk_index)),
+                        from_stage="latent_engine",
+                        metadata={"modality": "audio_latents", "stream": True},
+                    ),
+                )
+            ]
+        )
+        if not enable_fast_start and chunk_index < 3:
+            assert not pool.steps
+            assert vocoder.outbox.empty()
+        else:
+            pass
+    step_frames = [latents.shape[1] for step in pool.steps for latents in step.values()]
+    assert step_frames == ([4, 4] if enable_fast_start else [16])
+
+
+@pytest.mark.parametrize("patch_count", [1, 2, 3])
+def test_full_startup_batch_drains_short_utterance_at_eos(patch_count: int) -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        enable_streaming_fast_start=False,
+        merge_steps=4,
+        slot_pool=pool,
+    )
+    state = vocoder.create_stream_state("short")
+    patches = [patch(float(index)) for index in range(patch_count)]
+    for latent_patch in patches:
+        vocoder.ingest("short", state, latent_patch)
+    assert not pool.steps
+    assert vocoder.decode_delta("short", state, is_final=True) is not None
+    consumed = [latents for step in pool.steps for latents in step.values()]
+    torch.testing.assert_close(torch.cat(consumed, dim=1), torch.cat(patches, dim=1))
+    assert not state.pending
+    assert state.slot is None
+    assert not pool.in_use
 
 
 def test_select_step_participants_respects_max_batch_size() -> None:
@@ -223,6 +284,7 @@ def test_select_step_participants_respects_max_batch_size() -> None:
         max_batch_size=2,
         stream_slots=8,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     assert vocoder.stream_chunk_batch_max == 2
 
@@ -249,6 +311,7 @@ def test_stream_chunk_batch_cap_follows_max_batch_size_not_slots() -> None:
         max_batch_size=8,
         stream_slots=1,
         slot_pool=RecordingSlotPool(num_slots=1),
+        enable_streaming_fast_start=True,
     )
     assert vocoder.stream_chunk_batch_max == 8
     assert vocoder.stream_slots == 1
@@ -264,6 +327,7 @@ def test_select_step_participants_defers_fresh_small_groups() -> None:
         stream_slots=4,
         stream_group_wait_ms=100,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     state = vocoder.create_stream_state("a")
     vocoder.stream_states["a"] = state
@@ -272,8 +336,10 @@ def test_select_step_participants_defers_fresh_small_groups() -> None:
 
     # A freshly-ready group below the cap waits for more arrivals.
     assert vocoder.select_step_participants() == []
+    assert vocoder.has_ready_work() is False
     # Once aged past the wait bound it steps immediately.
     state.ready_since_ns -= 200_000_000
+    assert vocoder.has_ready_work() is True
     assert [request_id for request_id, _ in vocoder.select_step_participants()] == ["a"]
 
 
@@ -287,6 +353,7 @@ def test_select_step_participants_full_group_steps_immediately() -> None:
         stream_slots=4,
         stream_group_wait_ms=100,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     for request_id in ("a", "b", "c", "d"):
         state = vocoder.create_stream_state(request_id)
@@ -295,6 +362,76 @@ def test_select_step_participants_full_group_steps_immediately() -> None:
 
     participants = vocoder.select_step_participants()
     assert len(participants) == 4
+
+
+def test_group_wait_expires_without_another_stream_message() -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        stream_group_wait_ms=20,
+        slot_pool=pool,
+        enable_streaming_fast_start=True,
+    )
+    state = vocoder.create_stream_state("waiting")
+    vocoder.stream_states["waiting"] = state
+    vocoder.ingest("waiting", state, patch(1.0))
+    worker = threading.Thread(target=vocoder.start)
+    worker.start()
+    try:
+        message = vocoder.outbox.get(timeout=3)
+        assert message.request_id == "waiting"
+        assert message.type == "stream"
+        assert len(pool.steps) == 1
+        assert not state.pending
+        with pytest.raises(Empty):
+            vocoder.outbox.get(timeout=0.15)
+    finally:
+        vocoder.stop()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert not pool.in_use
+
+
+@pytest.mark.parametrize("abort_request", [False, True])
+@pytest.mark.parametrize("enable_fast_start", [False, True])
+def test_idle_poll_preserves_incomplete_or_aborted_stream(
+    abort_request: bool, enable_fast_start: bool
+) -> None:
+    pool = RecordingSlotPool()
+    vocoder = DotsTTSStreamingVocoder(
+        make_codec(),
+        optimize=True,
+        merge_steps=4,
+        slot_pool=pool,
+        enable_streaming_fast_start=enable_fast_start,
+    )
+    state = vocoder.create_stream_state("waiting")
+    vocoder.stream_states["waiting"] = state
+    if enable_fast_start:
+        for value in (1.0, 2.0):
+            vocoder.ingest("waiting", state, patch(value))
+            participants = vocoder.select_step_participants()
+            vocoder.run_step(participants, vocoder.build_step_plan(participants))
+    else:
+        pass
+    initial_step_count = len(pool.steps)
+    vocoder.ingest("waiting", state, patch(3.0))
+    if abort_request:
+        vocoder.abort("waiting")
+    else:
+        pass
+    worker = threading.Thread(target=vocoder.start)
+    worker.start()
+    try:
+        with pytest.raises(Empty):
+            vocoder.outbox.get(timeout=0.2)
+        assert len(pool.steps) == initial_step_count
+    finally:
+        vocoder.stop()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert not pool.in_use
 
 
 def test_group_wait_resets_after_draining_pending_patches() -> None:
@@ -307,6 +444,7 @@ def test_group_wait_resets_after_draining_pending_patches() -> None:
         stream_slots=4,
         stream_group_wait_ms=100,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     fresh = vocoder.create_stream_state("fresh")
     vocoder.stream_states["fresh"] = fresh
@@ -330,6 +468,7 @@ def test_streaming_groups_by_exact_frame_count() -> None:
         stream_slots=4,
         stream_group_wait_ms=0,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     early = vocoder.create_stream_state("early")
     steady = vocoder.create_stream_state("steady")
@@ -357,6 +496,7 @@ def test_stream_done_flushes_and_releases_slot() -> None:
         optimize=True,
         merge_steps=2,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     state = vocoder.create_stream_state("req")
     vocoder.ingest("req", state, patch(1.0))
@@ -378,6 +518,7 @@ def test_stream_done_drains_large_backlog_in_merge_step_pieces() -> None:
         optimize=True,
         merge_steps=2,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     state = vocoder.create_stream_state("req")
     for value in (1.0, 2.0, 3.0, 4.0, 5.0):
@@ -392,9 +533,7 @@ def test_stream_done_drains_large_backlog_in_merge_step_pieces() -> None:
 def test_release_stream_resources_returns_slot() -> None:
     pool = RecordingSlotPool()
     vocoder = DotsTTSStreamingVocoder(
-        make_codec(),
-        optimize=False,
-        slot_pool=pool,
+        make_codec(), optimize=False, slot_pool=pool, enable_streaming_fast_start=True
     )
     state = vocoder.create_stream_state("req")
     vocoder.ingest("req", state, patch())
@@ -411,6 +550,7 @@ def test_slot_exhaustion_raises_clear_admission_error() -> None:
         optimize=True,
         stream_slots=1,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     first = vocoder.create_stream_state("a")
     vocoder.ingest("a", first, patch())
@@ -428,6 +568,7 @@ def test_on_stream_chunk_batch_uses_pool_not_compiled_stream_step() -> None:
         merge_steps=2,
         stream_group_wait_ms=0,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     payload_state = vocoder.create_stream_state("req")
     vocoder.stream_states["req"] = payload_state
@@ -456,6 +597,7 @@ def test_decode_delta_non_final_is_a_no_op() -> None:
         optimize=True,
         merge_steps=2,
         slot_pool=pool,
+        enable_streaming_fast_start=True,
     )
     state = vocoder.create_stream_state("req")
     vocoder.ingest("req", state, patch(1.0))

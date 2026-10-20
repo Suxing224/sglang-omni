@@ -278,26 +278,8 @@ class DotsVocoderSlotPool:
             )
         else:
             pass
-        graph_runner = self.graph_runner
-        required_frames = max(self.total_frames[slot] + step_t for slot in slots)
-        for decoder_frames, prefix_runner in sorted(self.prefix_graph_runners.items()):
-            if (
-                required_frames <= decoder_frames
-                and (len(slots), step_t) in prefix_runner.captured_keys
-            ):
-                graph_runner = prefix_runner
-                break
-            else:
-                pass
-        replayed = (
-            None
-            if graph_runner is None
-            else graph_runner.run((packed, hidden_h, hidden_c, window, valid))
-        )
-        audio_window, hidden_h, hidden_c, new_window = (
-            self.forward(packed, hidden_h, hidden_c, window, valid)
-            if replayed is None
-            else replayed
+        audio_window, hidden_h, hidden_c, new_window = self.forward_window_step(
+            slots, packed, hidden_h, hidden_c, window, valid
         )
 
         self.lstm_h[:, slot_index, :] = hidden_h
@@ -308,6 +290,38 @@ class DotsVocoderSlotPool:
             self.total_frames[slot] += step_t
             out[slot] = self.slice_audio(slot, audio_window[row : row + 1], final=False)
         return out
+
+    def forward_window_step(
+        self,
+        slots: list[int],
+        packed: torch.Tensor,
+        hidden_h: torch.Tensor,
+        hidden_c: torch.Tensor,
+        window: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        step_frames = int(packed.shape[-1])
+        graph_runner = self.graph_runner
+        required_frames = max(self.total_frames[slot] + step_frames for slot in slots)
+        for decoder_frames, prefix_runner in sorted(self.prefix_graph_runners.items()):
+            if (
+                required_frames <= decoder_frames
+                and (len(slots), step_frames) in prefix_runner.captured_keys
+            ):
+                graph_runner = prefix_runner
+                break
+            else:
+                pass
+        replayed = (
+            None
+            if graph_runner is None
+            else graph_runner.run((packed, hidden_h, hidden_c, window, valid))
+        )
+        return (
+            self.forward(packed, hidden_h, hidden_c, window, valid)
+            if replayed is None
+            else replayed
+        )
 
     @torch.no_grad()
     def step_mixed(
@@ -321,15 +335,7 @@ class DotsVocoderSlotPool:
         valid: torch.Tensor,
         step_frames: int,
     ) -> dict[int, torch.Tensor]:
-        """Warm rows take the window path; hot rows take the conv-cache path.
-
-        Zero-initialized caches replay the window mask's boundary zeros at every
-        layer except the replicate-padded activations, so rows younger than
-        warmup_frames stay on the reference window path. The step that crosses
-        the threshold runs an eager hooked window decode and seeds the flat
-        cache from the captured layer inputs; from the next step on the row
-        joins the conv-cache batch bit-identically.
-        """
+        """Use window decoding until each row can seed its layer caches."""
         assert self.conv_cache_decoder is not None
         warmup = self.conv_cache_decoder.warmup_frames
         warm_rows = [
@@ -396,12 +402,7 @@ class DotsVocoderSlotPool:
         )
         captured: dict[int, torch.Tensor] | None = None
         if crossing:
-            # note (codex): hooks only fire in eager mode; a crossing step pays
-            # one eager window decode per stream and the captured layer inputs
-            # seed the flat cache for the conv-cache steps that follow. The
-            # decode trims to the rows' valid frames (same geometry as the
-            # prefix graphs), so the one-time cost scales with warmup + step,
-            # not the full window.
+            # note (codex): Seed from eager hooks once, using only valid frames.
             decoder_frames = max(
                 min(self.total_frames[slot] + step_frames, self.window_size)
                 for slot in slots
@@ -417,30 +418,8 @@ class DotsVocoderSlotPool:
                 )
             captured = hooked
         else:
-            graph_runner = self.graph_runner
-            required_frames = max(
-                self.total_frames[slot] + step_frames for slot in slots
-            )
-            for decoder_frames, prefix_runner in sorted(
-                self.prefix_graph_runners.items()
-            ):
-                if (
-                    required_frames <= decoder_frames
-                    and (len(slots), step_frames) in prefix_runner.captured_keys
-                ):
-                    graph_runner = prefix_runner
-                    break
-                else:
-                    pass
-            replayed = (
-                None
-                if graph_runner is None
-                else graph_runner.run((packed, hidden_h, hidden_c, window, valid))
-            )
-            audio_window, hidden_h, hidden_c, new_window = (
-                self.forward(packed, hidden_h, hidden_c, window, valid)
-                if replayed is None
-                else replayed
+            audio_window, hidden_h, hidden_c, new_window = self.forward_window_step(
+                slots, packed, hidden_h, hidden_c, window, valid
             )
         self.lstm_h[:, slot_index, :] = hidden_h
         self.lstm_c[:, slot_index, :] = hidden_c
@@ -523,14 +502,7 @@ class DotsVocoderSlotPool:
         hidden_c: torch.Tensor,
         step_frames: int,
     ) -> dict[int, torch.Tensor]:
-        """Conv-cache step: slot rows share one batched incremental decode.
-
-        Rows are always past warmup_frames (younger rows take step_warm), so
-        every cache row is seeded from a hooked window decode. Each row returns
-        its stable tail: the cache decoder reproduces the window path segment
-        for [total - step - lookahead, total - lookahead), and per-slot emitted
-        counters select the unseen suffix of it.
-        """
+        """Decode warmed rows and emit each slot's unseen stable suffix."""
         assert self.conv_cache_decoder is not None
         assert self.conv_cache_flat is not None
         flat_cache = self.conv_cache_flat.index_select(0, slot_index).contiguous()

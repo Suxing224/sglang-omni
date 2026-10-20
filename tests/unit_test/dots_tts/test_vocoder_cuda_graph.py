@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Graph-vs-eager contract for the slot-pool AudioVAE step.
-
-The fake inference below is deliberately nonlinear and state-dependent per
-row, so a stale static buffer, a cross-row leak, or a wrong (B, T) lookup
-changes the waveform instead of cancelling out.
-"""
+"""Graph replay and incremental AudioVAE decoding regression tests."""
 
 from __future__ import annotations
 
-import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -47,8 +41,7 @@ NUM_SLOTS = 6
 MODEL_MAX_GENERATE_PATCHES = 500
 MODEL_PATCH_FRAMES = 4
 MODEL_HOP_SAMPLES = 1920
-
-logger = logging.getLogger(__name__)
+REFERENCE_CHUNK_SAMPLES = 65536
 
 
 @pytest.mark.accelerator
@@ -129,9 +122,14 @@ def test_long_upsampling_matches_filter_definition_after_graph_replay(
         convolution_windows = F.pad(
             inserted, (module.kernel_size - 1, module.kernel_size - module.stride)
         ).unfold(-1, module.kernel_size, 1)
-        expected = module.ratio * (
-            convolution_windows * filter_weights.flip(-1).unsqueeze(0)
-        ).sum(-1)
+        # note (codex): Bound the FIR product without shortening the waveform.
+        expected = convolution_windows.new_empty(convolution_windows.shape[:-1])
+        for sample_start in range(0, expected.shape[-1], REFERENCE_CHUNK_SAMPLES):
+            sample_slice = slice(sample_start, sample_start + REFERENCE_CHUNK_SAMPLES)
+            expected[..., sample_slice] = module.ratio * (
+                convolution_windows[..., sample_slice, :]
+                * filter_weights.flip(-1).unsqueeze(0)
+            ).sum(-1)
         if module.causal:
             expected = expected[..., : -(module.kernel_size - module.stride)]
         else:
@@ -144,14 +142,23 @@ def test_long_upsampling_matches_filter_definition_after_graph_replay(
 
 
 class NonlinearInference:
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, seed: int = 0) -> None:
         self.device = device
+        self.dtype = torch.float32
+        self.lookahead = 1
+        self.left_context = 3
         self.vocoder = SimpleNamespace(hop_size=HOP)
-        generator = torch.Generator().manual_seed(0)
+        generator = torch.Generator().manual_seed(seed)
         self.drive = torch.rand(1, 1, HIDDEN, generator=generator).to(device)
 
     def init_stream_state(self, *, batch_size: int, chunk_size: int):
-        window = torch.zeros(batch_size, LATENT_DIM, chunk_size + 4, device=self.device)
+        window = torch.zeros(
+            batch_size,
+            LATENT_DIM,
+            chunk_size + self.lookahead + self.left_context,
+            device=self.device,
+            dtype=self.dtype,
+        )
         hidden = torch.zeros(1, batch_size, HIDDEN, device=self.device)
         return SimpleNamespace(
             lstm_hidden=(hidden, hidden.clone()),
@@ -161,7 +168,7 @@ class NonlinearInference:
     def _decoder_stream_lookahead(
         self,
     ) -> int:  # noqa: leading-underscore  # AudioVAE interface
-        return 1
+        return self.lookahead
 
     def _validate_stream_latents(
         self, latents: torch.Tensor
@@ -175,11 +182,12 @@ class NonlinearInference:
         self, latents, hidden
     ):  # noqa: leading-underscore  # AudioVAE interface
         hidden_h, hidden_c = hidden
+        latents = latents.float()
         drive = latents.mean(dim=(1, 2))
         hidden_h = torch.tanh(hidden_h * 0.9 + drive[None, :, None] * self.drive)
         hidden_c = hidden_c + latents.abs().mean(dim=(1, 2))[None, :, None]
         gain = 1.0 + hidden_h.sum(dim=(0, 2))
-        return latents * gain[:, None, None], (hidden_h, hidden_c)
+        return (latents * gain[:, None, None]).to(self.dtype), (hidden_h, hidden_c)
 
     def _decode_stream_window(
         self, window: torch.Tensor
@@ -243,14 +251,25 @@ def run_scenario(pool: DotsVocoderSlotPool, steps) -> list[dict[int, torch.Tenso
     return outputs
 
 
-def assert_same_outputs(reference, candidate) -> None:
+def assert_same_outputs(
+    reference: list[dict[int, torch.Tensor]],
+    candidate: list[dict[int, torch.Tensor]],
+    *,
+    rtol: float = 0.0,
+    atol: float = 0.0,
+) -> None:
     assert len(reference) == len(candidate)
-    for step_index, (expected, actual) in enumerate(zip(reference, candidate)):
+    for step_index, (expected, actual) in enumerate(
+        zip(reference, candidate, strict=True)
+    ):
         assert expected.keys() == actual.keys()
         for slot in expected:
-            assert torch.equal(expected[slot], actual[slot]), (
-                f"step {step_index} slot {slot} differs: "
-                f"max|delta|={(expected[slot] - actual[slot]).abs().max().item():.3e}"
+            torch.testing.assert_close(
+                actual[slot],
+                expected[slot],
+                rtol=rtol,
+                atol=atol,
+                msg=lambda message: f"step {step_index} slot {slot}: {message}",
             )
 
 
@@ -367,41 +386,32 @@ def test_real_convolutions_capture_and_replay_long_causal_waveforms(
 
 
 @pytest.mark.accelerator
-def test_graph_step_is_bit_identical_to_eager_across_aging_rows(
-    graph_device: torch.device,
+@pytest.mark.parametrize(
+    "captured_keys",
+    [ALL_KEYS, [(2, PATCH), (4, CHUNK)]],
+    ids=["all-shapes", "eager-fallback"],
+)
+def test_graph_step_matches_eager_across_aging_rows(
+    graph_device: torch.device, captured_keys: list[tuple[int, int]]
 ) -> None:
-    device = graph_device
-    steps = scenario_inputs(device)
-    reference = run_scenario(make_pool(device), steps)
-
-    pool = make_pool(device, graph_keys=ALL_KEYS)
-    assert pool.graph_runner.captured_keys == ALL_KEYS
+    steps = scenario_inputs(graph_device)
+    reference = run_scenario(make_pool(graph_device), steps)
+    pool = make_pool(graph_device, graph_keys=captured_keys)
+    assert pool.graph_runner.captured_keys == captured_keys
     assert_same_outputs(reference, run_scenario(pool, steps))
-    assert pool.graph_runner.replays == len(SCENARIO)
-    assert pool.graph_runner.misses == 0
-
-
-@pytest.mark.accelerator
-def test_uncaptured_shape_falls_back_to_eager_bit_identically(
-    graph_device: torch.device,
-) -> None:
-    device = graph_device
-    steps = scenario_inputs(device)
-    reference = run_scenario(make_pool(device), steps)
-
-    captured = [(2, PATCH), (4, CHUNK)]
-    pool = make_pool(device, graph_keys=captured)
-    assert_same_outputs(reference, run_scenario(pool, steps))
-    hits = sum(1 for slots, frames in SCENARIO if (len(slots), frames) in captured)
+    hits = sum((len(slots), frames) in captured_keys for slots, frames in SCENARIO)
     assert pool.graph_runner.replays == hits
     assert pool.graph_runner.misses == len(SCENARIO) - hits
 
 
 def make_streaming_vocoder(
-    device: torch.device, **kwargs: bool | int
+    device: torch.device,
+    *,
+    inference: NonlinearInference | TinyDecoderInference | None = None,
+    **kwargs: bool | int,
 ) -> DotsTTSStreamingVocoder:
     codec = SimpleNamespace(
-        inference=NonlinearInference(device),
+        inference=NonlinearInference(device) if inference is None else inference,
         lock=threading.RLock(),
         sample_rate=48000,
         patch_size=PATCH,
@@ -410,7 +420,12 @@ def make_streaming_vocoder(
         hop_size=HOP,
     )
     return DotsTTSStreamingVocoder(
-        codec, **{"optimize": True, "enable_streaming_conv_cache": False, **kwargs}
+        codec,
+        **{
+            "optimize": True,
+            "enable_streaming_fast_start": True,
+            **kwargs,
+        },
     )
 
 
@@ -506,13 +521,8 @@ TINY_DECODER_CONFIG = AttrDict(
 )
 
 
-class TinyDecoderInference:
-    """Real tiny AudioVAE Decoder behind the streaming inference surface.
-
-    Weight sharing between the compared pools makes any structural mistake in
-    the incremental decoder (sequential resblocks, wrong cache length, wrong
-    slice) show up as a large step error, not a tolerance-level one.
-    """
+class TinyDecoderInference(NonlinearInference):
+    """Use the real tiny decoder with deterministic FP32 recurrent state."""
 
     def __init__(
         self, device: torch.device, *, dtype: torch.dtype = torch.float32
@@ -525,11 +535,9 @@ class TinyDecoderInference:
         hop_size = 1
         for rate in TINY_DECODER_CONFIG["upsample_rates"]:
             hop_size *= int(rate)
+        super().__init__(device, seed=7)
         self.vocoder = SimpleNamespace(decoder=decoder, hop_size=hop_size)
-        self.device = device
         self.dtype = dtype
-        generator = torch.Generator().manual_seed(7)
-        self.drive = torch.rand(1, 1, HIDDEN, generator=generator).to(device)
         self.lookahead = (int(decoder.conv_pre.kernel_size[0]) - 1) // 2
         # note (codex): run the upstream left-context formula on a bare real
         # instance so the window geometry never drifts from production.
@@ -538,45 +546,6 @@ class TinyDecoderInference:
         self.left_context = int(
             probe._decoder_stream_left_context()
         )  # noqa: leading-underscore  # AudioVAE interface
-
-    def init_stream_state(self, *, batch_size: int, chunk_size: int):
-        window_frames = chunk_size + self.lookahead + self.left_context
-        window = torch.zeros(
-            batch_size,
-            LATENT_DIM,
-            window_frames,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        hidden = torch.zeros(1, batch_size, HIDDEN, device=self.device)
-        return SimpleNamespace(
-            lstm_hidden=(hidden, hidden.clone()),
-            decoder=SimpleNamespace(window=window, chunk_size=chunk_size),
-        )
-
-    def _decoder_stream_lookahead(
-        self,
-    ) -> int:  # noqa: leading-underscore  # AudioVAE interface
-        return self.lookahead
-
-    def _validate_stream_latents(
-        self, latents: torch.Tensor
-    ) -> None:  # noqa: leading-underscore  # AudioVAE interface
-        if latents.ndim != 3 or int(latents.shape[1]) != LATENT_DIM:
-            raise ValueError(f"bad latents {tuple(latents.shape)}")
-        else:
-            pass
-
-    def _decode_stream_latents(
-        self, latents, hidden
-    ):  # noqa: leading-underscore  # AudioVAE interface
-        hidden_h, hidden_c = hidden
-        drive = latents.float().mean(dim=(1, 2))
-        hidden_h = torch.tanh(hidden_h * 0.9 + drive[None, :, None] * self.drive)
-        hidden_c = hidden_c + latents.float().abs().mean(dim=(1, 2))[None, :, None]
-        gain = 1.0 + hidden_h.sum(dim=(0, 2))
-        decoder_input = (latents.float() * gain[:, None, None]).to(dtype=self.dtype)
-        return decoder_input, (hidden_h, hidden_c)
 
     def _decode_stream_window(
         self, window: torch.Tensor
@@ -589,6 +558,22 @@ class TinyDecoderInference:
         return int(
             VocoderInference._activation_left_context(activation)
         )  # noqa: leading-underscore  # AudioVAE interface
+
+
+def make_decoder_pool(
+    inference: TinyDecoderInference, *, use_cache: bool = True
+) -> DotsVocoderSlotPool:
+    return DotsVocoderSlotPool(
+        inference,
+        num_slots=NUM_SLOTS,
+        chunk_size=CHUNK,
+        latent_dim=LATENT_DIM,
+        conv_cache_decoder=(
+            ConvCacheDecoder(SimpleNamespace(inference=inference))
+            if use_cache
+            else None
+        ),
+    )
 
 
 def conv_cache_scenario_steps(device: torch.device) -> list[dict[int, torch.Tensor]]:
@@ -611,10 +596,7 @@ def conv_cache_scenario_steps(device: torch.device) -> list[dict[int, torch.Tens
 def run_pool_scenario(
     pool: DotsVocoderSlotPool, steps: list[dict[int, torch.Tensor]]
 ) -> list[dict[int, torch.Tensor]]:
-    for _ in range(4):
-        pool.acquire()
-    outputs = [pool.step(step) for step in steps]
-    outputs.append({slot: pool.flush(slot) for slot in range(4)})
+    outputs = run_scenario(pool, steps)
     device = steps[0][0].device
     for slot in (0, 1):
         pool.release(slot)
@@ -633,43 +615,6 @@ def run_pool_scenario(
     return outputs
 
 
-def assert_conv_cache_pair_matches(
-    reference: list[dict[int, torch.Tensor]],
-    actual: list[dict[int, torch.Tensor]],
-    *,
-    rtol: float,
-    atol: float,
-) -> None:
-    assert len(reference) == len(actual)
-    max_error = 0.0
-    for step_index, (expected, candidate) in enumerate(
-        zip(reference, actual, strict=True)
-    ):
-        assert expected.keys() == candidate.keys()
-        for slot in expected:
-            expected_audio = expected[slot]
-            candidate_audio = candidate[slot]
-            assert int(expected_audio.shape[-1]) == int(candidate_audio.shape[-1]), (
-                f"step {step_index} slot {slot} length differs: "
-                f"{int(expected_audio.shape[-1])} vs {int(candidate_audio.shape[-1])}"
-            )
-            if expected_audio.numel():
-                max_error = max(
-                    max_error,
-                    float((expected_audio - candidate_audio).abs().max()),
-                )
-            else:
-                pass
-            torch.testing.assert_close(
-                candidate_audio,
-                expected_audio,
-                rtol=rtol,
-                atol=atol,
-                msg=lambda message: f"step {step_index} slot {slot}: {message}",
-            )
-    logger.info(f"conv-cache scenario max abs err: {max_error:.6e}")
-
-
 def run_window_cache_pair(
     device: torch.device, *, dtype: torch.dtype
 ) -> tuple[list[dict[int, torch.Tensor]], list[dict[int, torch.Tensor]]]:
@@ -677,24 +622,14 @@ def run_window_cache_pair(
     steps = conv_cache_scenario_steps(device)
     pair: list[list[dict[int, torch.Tensor]]] = []
     for use_cache in (False, True):
-        pool = DotsVocoderSlotPool(
-            inference,
-            num_slots=NUM_SLOTS,
-            chunk_size=CHUNK,
-            latent_dim=LATENT_DIM,
-            conv_cache_decoder=(
-                ConvCacheDecoder(SimpleNamespace(inference=inference))
-                if use_cache
-                else None
-            ),
-        )
+        pool = make_decoder_pool(inference, use_cache=use_cache)
         pair.append(run_pool_scenario(pool, steps))
     return pair[0], pair[1]
 
 
 def test_conv_cache_matches_window_path_on_cpu() -> None:
     reference, actual = run_window_cache_pair(torch.device("cpu"), dtype=torch.float32)
-    assert_conv_cache_pair_matches(reference, actual, rtol=1e-4, atol=1e-5)
+    assert_same_outputs(reference, actual, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.accelerator
@@ -705,9 +640,9 @@ def test_conv_cache_matches_window_path_on_accelerator(
 ) -> None:
     reference, actual = run_window_cache_pair(graph_device, dtype=dtype)
     if dtype == torch.float16:
-        assert_conv_cache_pair_matches(reference, actual, rtol=2e-2, atol=2e-2)
+        assert_same_outputs(reference, actual, rtol=2e-2, atol=2e-2)
     else:
-        assert_conv_cache_pair_matches(reference, actual, rtol=1e-4, atol=1e-5)
+        assert_same_outputs(reference, actual, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.accelerator
@@ -718,22 +653,8 @@ def test_conv_cache_graph_step_is_bit_identical_to_eager(
 ) -> None:
     inference = TinyDecoderInference(graph_device, dtype=dtype)
     steps = scenario_inputs(graph_device)
-    eager_pool = DotsVocoderSlotPool(
-        inference,
-        num_slots=NUM_SLOTS,
-        chunk_size=CHUNK,
-        latent_dim=LATENT_DIM,
-        conv_cache_decoder=ConvCacheDecoder(SimpleNamespace(inference=inference)),
-    )
-    reference = run_scenario(eager_pool, steps)
-
-    pool = DotsVocoderSlotPool(
-        inference,
-        num_slots=NUM_SLOTS,
-        chunk_size=CHUNK,
-        latent_dim=LATENT_DIM,
-        conv_cache_decoder=ConvCacheDecoder(SimpleNamespace(inference=inference)),
-    )
+    reference = run_scenario(make_decoder_pool(inference), steps)
+    pool = make_decoder_pool(inference)
     runner = DotsVocoderGraphRunner(
         forward=pool.forward_conv_cache,
         new_inputs=pool.new_conv_cache_step_inputs,
@@ -769,17 +690,10 @@ def test_conv_cache_wiring_keeps_window_graphs_for_warmup(
         pytest.skip("conv cache is enabled on NPU only")
     else:
         pass
-    codec = SimpleNamespace(
+    vocoder = make_streaming_vocoder(
+        graph_device,
         inference=TinyDecoderInference(graph_device),
-        lock=threading.RLock(),
-        sample_rate=48000,
-        patch_size=PATCH,
-        latent_dim=LATENT_DIM,
-        device=graph_device,
-        hop_size=HOP,
-    )
-    vocoder = DotsTTSStreamingVocoder(
-        codec, optimize=True, enable_streaming_conv_cache=True
+        enable_streaming_conv_cache=True,
     )
     pool = vocoder.ensure_slot_pool()
     assert pool.conv_cache_decoder is not None
@@ -789,8 +703,8 @@ def test_conv_cache_wiring_keeps_window_graphs_for_warmup(
     # stay wired exactly like the no-conv-cache pool.
     assert pool.graph_runner is not None
     assert pool.graph_runner.captured_keys == ALL_KEYS
-    reference_pool = DotsTTSStreamingVocoder(
-        codec, optimize=True, enable_streaming_conv_cache=False
+    reference_pool = make_streaming_vocoder(
+        graph_device, inference=vocoder.codec.inference
     ).ensure_slot_pool()
     assert (
         pool.prefix_graph_runners.keys() == reference_pool.prefix_graph_runners.keys()

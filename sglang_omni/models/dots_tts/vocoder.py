@@ -180,6 +180,7 @@ class DotsTTSStreamingVocoder(
         codec: DotsAudioCodec,
         *,
         optimize: bool,
+        enable_streaming_fast_start: bool,
         enable_streaming_audio_vae_cuda_graph: bool = True,
         enable_streaming_conv_cache: bool = False,
         merge_steps: int = 4,
@@ -218,6 +219,7 @@ class DotsTTSStreamingVocoder(
             pass
         self.codec = codec
         self.optimize = bool(optimize)
+        self.enable_streaming_fast_start = enable_streaming_fast_start
         self.merge_steps = int(merge_steps) if optimize else 1
         self.stream_slots = int(stream_slots)
         self.enable_streaming_audio_vae_cuda_graph = bool(
@@ -397,6 +399,11 @@ class DotsTTSStreamingVocoder(
         with self.codec.lock:
             self.get_or_create_pool_locked().release(state.slot)
         state.slot = None
+
+    def has_ready_work(self) -> bool:
+        # note (codex): Expired groups must drain even while the producer is idle.
+        with self.state_lock:
+            return bool(self.select_step_participants())
 
     def select_step_participants(self) -> list[tuple[str, DotsStreamState]]:
         slotted = [
@@ -649,14 +656,14 @@ class DotsTTSStreamingVocoder(
             return False
         else:
             pass
-        if state.received_patches <= 2:
+        if self.enable_streaming_fast_start and state.received_patches <= 2:
             return True
         else:
             pass
         return len(state.pending) >= self.merge_steps
 
     def take_patches(self, state: DotsStreamState) -> int:
-        if state.received_patches <= 2:
+        if self.enable_streaming_fast_start and state.received_patches <= 2:
             return 1
         else:
             pass

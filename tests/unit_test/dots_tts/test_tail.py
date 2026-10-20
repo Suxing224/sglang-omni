@@ -27,6 +27,15 @@ FM_HIDDEN = 32
 LATENT_DIM = 6
 PATCH_SIZE = 2
 NFE = 2
+TAIL_POOL_SLOT_DIMENSIONS = {
+    "dit_k": 2,
+    "dit_v": 2,
+    "encoder_k": 1,
+    "encoder_v": 1,
+    "encoder_conv_tail": 0,
+    "window": 0,
+    "all_mods": 1,
+}
 
 
 def test_batched_tail_mask_hides_padding_and_preserves_causality() -> None:
@@ -432,53 +441,55 @@ def test_feedback_matches_full_encoder_on_accelerator(device_type: str) -> None:
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def build_tail_graph_pair(
+    device: torch.device,
+    *,
+    slots: int,
+    flow_frames: int,
+    encoder_frames: int,
+    normalization: Literal["LayerNorm", "RMSNorm"] = "LayerNorm",
+) -> tuple[tail.DotsTtsAcousticTail, tail.DotsTtsAcousticTail]:
+    torch.manual_seed(1234)
+    dtype = torch.bfloat16
+    model = TailModel(normalization).eval().to(device=device, dtype=dtype)
+    graph_model = copy.deepcopy(model)
+    torch.manual_seed(9)
+    eager = build_tail(
+        model, slots=slots, device=device, dtype=dtype, patch_capacity=33
+    )
+    torch.manual_seed(9)
+    graph = build_tail(
+        graph_model,
+        slots=slots,
+        device=device,
+        dtype=dtype,
+        patch_capacity=33,
+        optimize=True,
+    )
+    for name in TAIL_POOL_SLOT_DIMENSIONS:
+        eager_pool = getattr(eager, name)
+        eager_pool.normal_(0, 0.05)
+        getattr(graph, name).copy_(eager_pool)
+    for slot in range(slots):
+        eager._fm_seq_len[slot] = graph._fm_seq_len[slot] = (
+            flow_frames  # noqa: leading-underscore  # Model state contract
+        )
+        eager.encoder_seq_len[slot] = graph.encoder_seq_len[slot] = encoder_frames
+        eager.initialize_slot_rng(slot, 100 + slot)
+        graph.initialize_slot_rng(slot, 100 + slot)
+    return eager, graph
+
+
 @pytest.mark.accelerator
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])
 def test_batched_tail_graph_matches_eager_for_dynamic_slot_order(
     device_type: str,
 ) -> None:
     device = require_tail_device(device_type)
-    torch.manual_seed(1234)
     dtype = torch.bfloat16
-    eager_model = TailModel().eval().to(device=device, dtype=dtype)
-    graph_model = copy.deepcopy(eager_model)
-    torch.manual_seed(9)
-    eager = build_tail(
-        eager_model,
-        slots=8,
-        device=device,
-        dtype=dtype,
-        patch_capacity=33,
+    eager, graph = build_tail_graph_pair(
+        device, slots=8, flow_frames=15, encoder_frames=4
     )
-    torch.manual_seed(9)
-    graph = build_tail(
-        graph_model,
-        slots=8,
-        device=device,
-        dtype=dtype,
-        patch_capacity=33,
-        optimize=True,
-    )
-
-    for name in (
-        "dit_k",
-        "dit_v",
-        "encoder_k",
-        "encoder_v",
-        "encoder_conv_tail",
-        "window",
-        "all_mods",
-    ):
-        eager_value = getattr(eager, name)
-        eager_value.normal_(0, 0.05)
-        getattr(graph, name).copy_(eager_value)
-    for slot in range(8):
-        eager._fm_seq_len[slot] = graph._fm_seq_len[slot] = (
-            15  # noqa: leading-underscore  # production name
-        )
-        eager.encoder_seq_len[slot] = graph.encoder_seq_len[slot] = 4
-        eager.initialize_slot_rng(slot, 100 + slot)
-        graph.initialize_slot_rng(slot, 100 + slot)
 
     slots = [7, 2, 5, 0, 6, 1, 4, 3]
     hidden = torch.randn(8, FM_HIDDEN, device=device, dtype=dtype)
@@ -626,52 +637,14 @@ def test_npu_tail_graphs_cover_dynamic_batches_and_preserve_inactive_slots(
     device = require_tail_device("npu")
     dtype = torch.bfloat16
     slot_count = 16
-    torch.manual_seed(1234)
-    eager_model = TailModel(normalization).eval().to(device=device, dtype=dtype)
-    graph_model = copy.deepcopy(eager_model)
-    torch.manual_seed(9)
-    eager = build_tail(
-        eager_model, slots=slot_count, device=device, dtype=dtype, patch_capacity=33
-    )
-    torch.manual_seed(9)
-    graph = build_tail(
-        graph_model,
+    eager, graph = build_tail_graph_pair(
+        device,
         slots=slot_count,
-        device=device,
-        dtype=dtype,
-        patch_capacity=33,
-        optimize=True,
+        flow_frames=40,
+        encoder_frames=12,
+        normalization=normalization,
     )
-    pool_names = (
-        "dit_k",
-        "dit_v",
-        "encoder_k",
-        "encoder_v",
-        "encoder_conv_tail",
-        "window",
-        "all_mods",
-    )
-    for name in pool_names:
-        eager_pool = getattr(eager, name)
-        eager_pool.normal_(0, 0.05)
-        getattr(graph, name).copy_(eager_pool)
-    for slot in range(slot_count):
-        eager._fm_seq_len[slot] = graph._fm_seq_len[slot] = (
-            40  # noqa: leading-underscore  # Model state contract
-        )
-        eager.encoder_seq_len[slot] = graph.encoder_seq_len[slot] = 12
-        eager.initialize_slot_rng(slot, 100 + slot)
-        graph.initialize_slot_rng(slot, 100 + slot)
     batch_sizes = [size for pair in zip(range(16, 8, -1), range(1, 9)) for size in pair]
-    slot_dimensions = {
-        "dit_k": 2,
-        "dit_v": 2,
-        "encoder_k": 1,
-        "encoder_v": 1,
-        "encoder_conv_tail": 0,
-        "window": 0,
-        "all_mods": 1,
-    }
     device_module = torch.get_device_module(device)
     current_stream = device_module.current_stream(device)
     replay_stream = device_module.Stream(device=device)
@@ -686,9 +659,9 @@ def test_npu_tail_graphs_cover_dynamic_batches_and_preserve_inactive_slots(
             )
             inactive_states = {
                 name: getattr(graph, name)
-                .index_select(slot_dimensions[name], inactive_slots)
+                .index_select(TAIL_POOL_SLOT_DIMENSIONS[name], inactive_slots)
                 .clone()
-                for name in pool_names
+                for name in TAIL_POOL_SLOT_DIMENSIONS
             }
             hidden = torch.randn(batch_size, FM_HIDDEN, device=device, dtype=dtype)
             eager_latent = eager.sample_patches(slots, fm_hidden_rows=hidden)
@@ -730,7 +703,7 @@ def test_npu_tail_graphs_cover_dynamic_batches_and_preserve_inactive_slots(
             for name, original_state in inactive_states.items():
                 torch.testing.assert_close(
                     getattr(graph, name).index_select(
-                        slot_dimensions[name], inactive_slots
+                        TAIL_POOL_SLOT_DIMENSIONS[name], inactive_slots
                     ),
                     original_state,
                     rtol=0,
