@@ -37,7 +37,7 @@ def convolution(
     dilation: int = 1,
     groups: int = 1,
 ) -> torch.Tensor:
-    # note (codex): Singleton spatial dimensions select capturable aclnn convolution.
+    # note: Singleton spatial dimensions select capturable aclnn convolution.
     spatial_padding = padding if isinstance(padding, str) else (0, padding)
     return F.conv2d(
         waveform[:, :, None, :],
@@ -99,7 +99,7 @@ def transposed_convolution_forward(
 
 def upsample_forward(module: UpSample1d, waveform: torch.Tensor) -> torch.Tensor:
     channels = waveform.shape[1]
-    # note (codex): NPU zero replicate padding corrupts long waveforms.
+    # note: NPU zero replicate padding corrupts long waveforms.
     if module.pad:
         waveform = F.pad(waveform, (module.pad, module.pad), mode="replicate")
     else:
@@ -108,7 +108,7 @@ def upsample_forward(module: UpSample1d, waveform: torch.Tensor) -> torch.Tensor
         weight = module.filter.expand(channels, -1, -1)
     else:
         weight = module.filter
-    # note (codex): Grouped FIR phases avoid slow depthwise transpose convolution.
+    # note: Grouped FIR phases avoid slow depthwise transpose convolution.
     full_samples = (waveform.shape[-1] - 1) * module.stride + module.kernel_size
     phase_taps = (module.kernel_size + module.stride - 1) // module.stride
     weight = weight.reshape(channels, module.kernel_size)
@@ -125,7 +125,7 @@ def upsample_forward(module: UpSample1d, waveform: torch.Tensor) -> torch.Tensor
     )
     trim_causal_tail = module.causal and module.kernel_size > module.stride
     if phase_taps > 1:
-        # note (codex): Causal cropping discards all right-padded FIR outputs.
+        # note: Causal cropping discards all right-padded FIR outputs.
         right_padding = 0 if trim_causal_tail else phase_taps - 1
         waveform = F.pad(waveform, (phase_taps - 1, right_padding))
     else:
@@ -161,7 +161,7 @@ def adapt_audio_vae_convolutions(audio_vae: nn.Module) -> None:
     if any(
         parameter.device.type == "npu" for parameter in audio_vae.parameters()
     ) or any(buffer.device.type == "npu" for buffer in audio_vae.buffers()):
-        # note (codex): Internal formats select uncapturable aclop Conv2D kernels.
+        # note: Internal formats select uncapturable aclop Conv2D kernels.
         torch.get_device_module("npu").config.allow_internal_format = False
         logger.info("dots.tts AudioVAE disabled process-wide NPU internal formats")
     else:

@@ -402,7 +402,7 @@ class DotsVocoderSlotPool:
         )
         captured: dict[int, torch.Tensor] | None = None
         if crossing:
-            # note (codex): Seed from eager hooks once, using only valid frames.
+            # note: Seed from eager hooks once, using only valid frames.
             decoder_frames = max(
                 min(self.total_frames[slot] + step_frames, self.window_size)
                 for slot in slots

@@ -91,7 +91,7 @@ def test_long_upsampling_matches_filter_definition_after_graph_replay(
     filter_weights = module.filter.detach().expand(channels, -1, -1).clone()
     module.to(graph_device)
     if graph_device.type == "npu":
-        # note (codex): Reproduce the format policy enabled by engine initialization.
+        # note: Reproduce the format policy enabled by engine initialization.
         torch.get_device_module(graph_device).config.allow_internal_format = True
         adapt_audio_vae_convolutions(module)
     else:
@@ -122,7 +122,7 @@ def test_long_upsampling_matches_filter_definition_after_graph_replay(
         convolution_windows = F.pad(
             inserted, (module.kernel_size - 1, module.kernel_size - module.stride)
         ).unfold(-1, module.kernel_size, 1)
-        # note (codex): Bound the FIR product without shortening the waveform.
+        # note: Bound the FIR product without shortening the waveform.
         expected = convolution_windows.new_empty(convolution_windows.shape[:-1])
         for sample_start in range(0, expected.shape[-1], REFERENCE_CHUNK_SAMPLES):
             sample_slice = slice(sample_start, sample_start + REFERENCE_CHUNK_SAMPLES)
@@ -542,7 +542,7 @@ class TinyDecoderInference(NonlinearInference):
         self.vocoder = SimpleNamespace(decoder=decoder, hop_size=hop_size)
         self.dtype = dtype
         self.lookahead = (int(decoder.conv_pre.kernel_size[0]) - 1) // 2
-        # note (codex): run the upstream left-context formula on a bare real
+        # note: run the upstream left-context formula on a bare real
         # instance so the window geometry never drifts from production.
         probe = object.__new__(VocoderInference)
         probe.vocoder = self.vocoder
@@ -580,7 +580,7 @@ def make_decoder_pool(
 
 
 def conv_cache_scenario_steps(device: torch.device) -> list[dict[int, torch.Tensor]]:
-    # note (codex): Mixed row ages and irregular flush tails exercise cache seeding.
+    # note: Mixed row ages and irregular flush tails exercise cache seeding.
     plan: list[tuple[tuple[int, ...], int]] = [((0,), 4), ((1,), 4), ((0, 1), 8)]
     for step_index in range(29):
         slots = (0, 1) if step_index % 4 else (0, 1, 2, 3)
@@ -667,7 +667,7 @@ def test_conv_cache_graph_step_is_bit_identical_to_eager(
     pool.conv_cache_graph_runner = runner
     actual = run_scenario(pool, steps)
     assert_same_outputs(reference, actual)
-    # note (codex): rows below warmup_frames take the eager window path, so only
+    # note: rows below warmup_frames take the eager window path, so only
     # steps that start with at least one hot row replay a conv-cache graph.
     assert pool.conv_cache_decoder is not None
     warmup = pool.conv_cache_decoder.warmup_frames
@@ -702,7 +702,7 @@ def test_conv_cache_wiring_keeps_window_graphs_for_warmup(
     assert pool.conv_cache_decoder is not None
     assert pool.conv_cache_graph_runner is not None
     assert pool.conv_cache_graph_runner.captured_keys == ALL_KEYS
-    # note (codex): pre-warmup rows still take the window path, so its graphs
+    # note: pre-warmup rows still take the window path, so its graphs
     # stay wired exactly like the no-conv-cache pool.
     assert pool.graph_runner is not None
     assert pool.graph_runner.captured_keys == ALL_KEYS

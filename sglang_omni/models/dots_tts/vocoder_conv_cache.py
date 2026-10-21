@@ -145,7 +145,7 @@ class ConvCacheDecoder:
         self.specs = specs
         self.flat_size = int(offset)
         self.use_tanh = bool(decoder.h.get("use_tanh_at_final", True))
-        # note (codex): Seed only when the window fills every layer's left context.
+        # note: Seed only when the window fills every layer's left context.
         rate = 1
         margin = 2 * self.lookahead
         for spec in specs:

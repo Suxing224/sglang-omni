@@ -716,7 +716,7 @@ class DotsTTSFlowHead(nn.Module):
             raise RuntimeError("dots.tts batched request is missing its tail slot")
         else:
             pass
-        # note (codex): Launch the EOS transfer before DiT to overlap its device work.
+        # note: Launch the EOS transfer before DiT to overlap its device work.
         self.stage_batched_eos(eos_hits)
         try:
             normalized = self.tail.sample_patches(

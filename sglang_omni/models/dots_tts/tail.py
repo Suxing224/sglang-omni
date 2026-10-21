@@ -39,7 +39,7 @@ def rms_normalization_forward(
     module: nn.RMSNorm, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     assert module.weight is not None
-    # note (codex): Torch's composite RMSNorm uses FP32 opmath epsilon for BF16.
+    # note: Torch's composite RMSNorm uses FP32 opmath epsilon for BF16.
     epsilon = torch.finfo(torch.float32).eps if module.eps is None else module.eps
     return torch.ops.npu.npu_rms_norm(hidden_states, module.weight, epsilon)[0]
 
@@ -191,7 +191,7 @@ class SemanticEncoderDecodeStep(nn.Module):
         latent_frames = torch.cat([conv_tail, raw], dim=-1)
         if latent_patch.device.type == "npu":
             assert projection.dilation == (1,) and projection.groups == 1
-            # note (codex): Windowed GEMM avoids the uncapturable aclop convolution path.
+            # note: Windowed GEMM avoids the uncapturable aclop convolution path.
             latent_windows = latent_frames.unfold(
                 -1, projection.weight.shape[-1], projection.stride[0]
             )

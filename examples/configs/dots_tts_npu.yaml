@@ -19,7 +19,7 @@ stages:
   preprocessing:
     process: reference
   reference_encode:
-    # note (codex): Reference precision is process-wide; keep vocoder graphs separate.
+    # note: Reference precision is process-wide; keep vocoder graphs separate.
     process: reference
     total_reserve_bytes: 3GiB
     factory:
@@ -33,7 +33,7 @@ stages:
     factory:
       optimize: true
     engine:
-      # note (codex): A byte budget leaves memory for the separate acoustic pools.
+      # note: A byte budget leaves memory for the separate acoustic pools.
       kv_cache_bytes: 2147483648
       max_running_requests: 16
       attention_backend: ascend

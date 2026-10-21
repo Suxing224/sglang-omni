@@ -184,15 +184,21 @@ class DotsTTSEngineBuilder(TtsEngineBuilder["DotsTTSSGLangRequestData"]):
         else:
             tail_backend = model.flow.batched_tail.backend
         logger.info(
-            f"dots.tts latent engine backend: {tail_backend} (optimize={self.optimize}, "
-            f"max_running_requests={max_running_requests}, num_steps={self.num_steps})"
+            "dots.tts latent engine backend: %s (optimize=%s, "
+            "max_running_requests=%d, num_steps=%d)",
+            tail_backend,
+            self.optimize,
+            max_running_requests,
+            self.num_steps,
         )
-        backbone_backend = (
-            "SGLang device graph with model-owned feedback buffer"
-            if not bool(get_exec().graph.disable_cuda_graph)
-            else "eager"
+        logger.info(
+            "dots.tts backbone decode: %s",
+            (
+                "SGLang device graph with model-owned feedback buffer"
+                if not bool(get_exec().graph.disable_cuda_graph)
+                else "eager"
+            ),
         )
-        logger.info(f"dots.tts backbone decode: {backbone_backend}")
 
     def make_model_runner(
         self,

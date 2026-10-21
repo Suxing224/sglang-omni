@@ -163,7 +163,7 @@ class DotsVocoderGraphRunner:
             device_module = torch.get_device_module(self.device)
             current_stream = device_module.current_stream(self.device)
             if self.device.type == "npu":
-                # note (codex): Keep NPU graph outputs ordered with their capture stream.
+                # note: Keep NPU graph outputs ordered with their capture stream.
                 captured.capture_stream.wait_stream(current_stream)
                 for live_input in step_inputs:
                     live_input.record_stream(captured.capture_stream)

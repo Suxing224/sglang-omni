@@ -237,7 +237,7 @@ class DotsTTSStreamingVocoder(
             if stream_chunk_batch_max is None
             else int(stream_chunk_batch_max)
         )
-        # note (codex): Small groups become eligible after this coalescing delay.
+        # note: Small groups become eligible after this coalescing delay.
         self.stream_group_wait_ms = float(stream_group_wait_ms)
         super().__init__(
             self.batch_vocoder.decode_payload,
@@ -325,7 +325,7 @@ class DotsTTSStreamingVocoder(
             else:
                 pass
             if state.slot is not None and state.pending:
-                # note (codex): drain in merge_steps pieces like the coalesced
+                # note: drain in merge_steps pieces like the coalesced
                 # pump does; group-wait deferral lets pending grow past one
                 # window (step length must stay < window size), so a single
                 # take-all step is not always legal.
@@ -401,7 +401,7 @@ class DotsTTSStreamingVocoder(
         state.slot = None
 
     def has_ready_work(self) -> bool:
-        # note (codex): Expired groups must drain even while the producer is idle.
+        # note: Expired groups must drain even while the producer is idle.
         with self.state_lock:
             return bool(self.select_step_participants())
 
@@ -502,7 +502,7 @@ class DotsTTSStreamingVocoder(
     def get_or_create_pool_locked(self) -> DotsVocoderSlotPool:
         # Caller must hold self.codec.lock (RLock).
         if self.slot_pool is None:
-            # note (codex): the conv-cache decoder only pays off where the
+            # note: the conv-cache decoder only pays off where the
             # full-window step is the pacer; other devices keep the window path.
             use_conv_cache = (
                 self.optimize
@@ -530,7 +530,7 @@ class DotsTTSStreamingVocoder(
                 )
             else:
                 pass
-            # note (codex): rows below warmup_frames still take the window path
+            # note: rows below warmup_frames still take the window path
             # on the conv-cache pool, so the window graphs stay wired either way.
             pool.graph_runner = (
                 self.capture_step_graphs(pool) if capture_graphs else None

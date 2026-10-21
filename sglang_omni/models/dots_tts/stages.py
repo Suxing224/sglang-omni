@@ -36,7 +36,6 @@ else:
     pass
 
 _DEFAULT_CONTEXT_LENGTH = 2048
-APOSTROPHE_TRANSLATION = str.maketrans({"\u2018": "'", "\u2019": "'"})
 
 
 def configure_optimized_kernels() -> None:
@@ -234,9 +233,7 @@ def preprocess_dots_tts_payload(
             default=False,
         )
     )
-    # note (codex): Typographic apostrophes must not turn contractions into spoken letters.
-    text = text.strip().translate(APOSTROPHE_TRANSLATION)
-    text = normalize_text(text) if normalize else text
+    text = normalize_text(text.strip()) if normalize else text.strip()
     language_value = first_not_none(
         request_inputs.get("language"), tts_params.get("language")
     )
@@ -256,9 +253,7 @@ def preprocess_dots_tts_payload(
         pass
     normalized_prompt_text = ""
     if prompt_text and prompt_text.strip():
-        normalized_prompt_text = (
-            prompt_text.strip().translate(APOSTROPHE_TRANSLATION) + "\n"
-        )
+        normalized_prompt_text = prompt_text.strip() + "\n"
         if language is not None:
             normalized_prompt_text = attach_language_tag(
                 normalized_prompt_text, language
@@ -477,7 +472,7 @@ def create_reference_encode_executor(
     elif concrete_device.type != "npu":
         raise ValueError("npu_convolution_allow_hf32 requires an NPU reference worker")
     else:
-        # note (codex): Configure the isolated worker before its first convolution.
+        # note: Configure the isolated worker before its first convolution.
         device_module = torch.get_device_module(concrete_device)
         device_module.conv.allow_hf32 = npu_convolution_allow_hf32
         logging.getLogger(__name__).info(
