@@ -9,6 +9,7 @@ from sglang_omni.platforms import current_platform
 
 if current_platform.is_npu():
     from sglang_omni.models.qwen3_tts.npu_sampling import seeded_gumbel_argmax_npu
+    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import murmur_hash32_npu
 else:
     pass
 
@@ -132,7 +133,7 @@ if has_triton_runtime():
     ):
         """One compare-exchange round of PyTorch's small descending sort.
 
-        Under the repository's ``torch==2.13.0`` pin,
+        Under the repository's torch pin,
         ``torch.topk(..., sorted=True)`` first gathers the selected entries and
         then uses this unstable 32-entry bitonic network for k <= 32. The
         equality behavior is observable by the seeded sampler, so a regular
@@ -678,15 +679,9 @@ def murmur_hash32_pytorch(
     positions: torch.Tensor,
     num_cols: int,
 ) -> torch.Tensor:
-    """Vectorized MurmurHash32 with an Ascend-safe CPU integer fallback."""
+    """Vectorized MurmurHash32 with graph-safe Ascend integer arithmetic."""
     if seeds.device.type == "npu":
-        # Ascend can fault in the int64 rotate expression under sustained
-        # concurrent sampling. The hash inputs are tiny; compute only this
-        # integer-only portion on CPU and return the exact uint32 values.
-        hash_inputs = torch.stack((seeds, positions)).cpu()
-        return murmur_hash32_pytorch_impl(hash_inputs[0], hash_inputs[1], num_cols).to(
-            seeds.device
-        )
+        return murmur_hash32_npu(seeds, positions, num_cols)
     else:
         return murmur_hash32_pytorch_impl(seeds, positions, num_cols)
 

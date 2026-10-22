@@ -6,7 +6,7 @@ from __future__ import annotations
 import inspect
 import runpy
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import SimpleNamespace, TracebackType
 from typing import Literal
 
 import pytest
@@ -27,7 +27,7 @@ def test_graph_backend_import_without_xpu_pool_type(
     monkeypatch.delattr(torch.xpu, "_POOL_HANDLE", raising=False)
     module = runpy.run_path(inspect.getfile(CudaDeviceGraphBackend))
 
-    assert module["XpuGraphPoolHandle"] is module["CudaGraphPoolHandle"]
+    assert module["XpuGraphPoolHandle"] == tuple[int, int]
 
 
 def recording_module(graph_attr: str) -> SimpleNamespace:
@@ -220,31 +220,48 @@ def test_each_backend_pools_through_its_own_module(
     assert backend.graph_pool_handle() is handle
 
 
-def test_xpu_backend_opens_the_capture_outside_inference_mode(monkeypatch) -> None:
-    """XPU's capture_begin updates the device generator state in place. Inside
-    inference mode that state becomes an inference tensor, and an inference tensor
-    cannot be updated in place afterwards, so every later capture in the process is
-    refused."""
+@pytest.mark.parametrize(
+    "backend, graph_attr, module_name",
+    [
+        (NpuDeviceGraphBackend(), "NPUGraph", "npu"),
+        (XpuDeviceGraphBackend(), "XPUGraph", "xpu"),
+    ],
+)
+@pytest.mark.parametrize("inference_mode_enabled", [False, True])
+def test_backend_opens_the_capture_outside_inference_mode(
+    backend: NpuDeviceGraphBackend | XpuDeviceGraphBackend,
+    graph_attr: str,
+    module_name: str,
+    inference_mode_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capture setup must leave cached tensors mutable outside inference mode."""
     begin_modes: list[bool] = []
 
-    class Ctx:
-        def __enter__(self):
+    class CaptureContext:
+        def __enter__(self) -> None:
             begin_modes.append(torch.is_inference_mode_enabled())
             return None
 
-        def __exit__(self, *args):
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool:
             return False
 
-    module = recording_module("XPUGraph")
-    module.graph = lambda **kwargs: Ctx()
-    monkeypatch.setattr(torch, "xpu", module)
+    module = recording_module(graph_attr)
+    module.graph = lambda **kwargs: CaptureContext()
+    monkeypatch.setattr(torch, module_name, module, raising=False)
 
-    with torch.inference_mode():
-        with XpuDeviceGraphBackend().capture():
+    with torch.inference_mode(inference_mode_enabled):
+        with backend.capture():
             body_mode = torch.is_inference_mode_enabled()
+        assert torch.is_inference_mode_enabled() is inference_mode_enabled
 
     assert begin_modes == [False]
-    assert body_mode is True
+    assert body_mode is inference_mode_enabled
 
 
 @pytest.mark.accelerator
