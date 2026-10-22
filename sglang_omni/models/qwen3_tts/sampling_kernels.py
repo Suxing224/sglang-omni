@@ -8,8 +8,10 @@ import torch
 from sglang_omni.platforms import current_platform
 
 if current_platform.is_npu():
-    from sglang_omni.models.qwen3_tts.npu_sampling import seeded_gumbel_argmax_npu
-    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import murmur_hash32_npu
+    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import (
+        murmur_hash32_npu,
+        seeded_gumbel_argmax_npu,
+    )
 else:
     pass
 

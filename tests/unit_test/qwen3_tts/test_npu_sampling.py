@@ -314,7 +314,7 @@ def test_npu_fused_gumbel_graph_replay_uses_updated_inputs() -> None:
 @pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("width", [1, 8, 50, 128, 1024])
 def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
-    from sglang_omni.models.qwen3_tts.npu_sampling import sample_top_k_npu
+    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import sample_top_k_npu
 
     generator = torch.Generator().manual_seed(1234)
     scores = torch.randn(256, width, generator=generator).sort(descending=True)[0]
@@ -341,7 +341,7 @@ def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
 
 @pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 def test_npu_top_k_graph_replay_reads_updated_limits() -> None:
-    from sglang_omni.models.qwen3_tts.npu_sampling import sample_top_k_npu
+    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import sample_top_k_npu
 
     scores = torch.zeros((16, 50), device="npu")
     indices = torch.arange(50, device="npu").expand(16, -1).contiguous()

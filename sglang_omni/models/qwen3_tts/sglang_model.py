@@ -72,7 +72,7 @@ from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 
 if current_platform.is_npu():
-    from sglang_omni.models.qwen3_tts.npu_sampling import sample_top_k_npu
+    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import sample_top_k_npu
 else:
     pass
 
