@@ -5,16 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def mix32(value: tl.tensor, key: tl.tensor) -> tl.tensor:
-    # note (cocoa): Masks prevent sign extension in Ascend right-shift lowering.
-    key = (key * 0xCC9E2D51).to(tl.uint32)
-    key = (key << 15) | ((key >> 17) & 0x7FFF)
-    key = (key * 0x1B873593).to(tl.uint32)
-    value = value ^ key
-    value = (value << 13) | ((value >> 19) & 0x1FFF)
-    return (value * 5 + 0xE6546B64).to(tl.uint32)
+from sglang_omni.models.qwen3_tts.sampling_kernels_npu import mix32
 
 
 @triton.jit
