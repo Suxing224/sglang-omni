@@ -28,6 +28,7 @@ from sglang_omni.proto import (
     AdminResult,
     AdminResultMessage,
     CompleteMessage,
+    FreezeGCMessage,
     OmniRequest,
     RequestInfo,
     RequestState,
@@ -363,6 +364,13 @@ class Coordinator(SessionGraphRunner):
             stages=stages,
             timeout_s=timeout_s,
         )
+
+    async def freeze_gc(self) -> None:
+        """Ask every stage process to freeze its heap; nothing waits for them."""
+        for stage_name, stage_info in self.stages.items():
+            await self.control_plane.submit_to_stage(
+                stage_name, stage_info.control_endpoint, FreezeGCMessage()
+            )
 
     async def pause_generation(
         self,

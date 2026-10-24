@@ -35,20 +35,22 @@ Use the selector below to generate the exact launch command for your configurati
 Colocated topology requires `--config examples/configs/qwen3_omni_colocated_h20.yaml`
 (or `qwen3_omni_colocated_h200.yaml` on H200) to set per-stage GPU memory budgets.
 
-| Mode | Topology | Thinker TP | Precision | Status |
-|---|---|---|---|---|
-| Thinker-only | — | — | BF16 | ✅ |
-| Thinker-only | — | — | FP8 | ✅ |
-| Thinker-only | — | — | AutoRound INT4 | ✅ |
-| Thinker-Talker | Disaggregated | TP=1 | BF16 | ✅ |
-| Thinker-Talker | Disaggregated | TP=1 | FP8 | ✅ |
-| Thinker-Talker | Disaggregated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
-| Thinker-Talker | Disaggregated | TP=2 | BF16 | ✅ |
-| Thinker-Talker | Disaggregated | TP=2 | FP8 | ✅ |
-| Thinker-Talker | Disaggregated | TP=2 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
-| Thinker-Talker | Colocated | TP=1 | BF16 | ✅ |
-| Thinker-Talker | Colocated | TP=1 | FP8 | ✅ |
-| Thinker-Talker | Colocated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
+All configurations listed below are supported.
+
+| Mode | Topology | Thinker TP | Precision |
+|---|---|---|---|
+| Thinker-only | — | — | BF16 |
+| Thinker-only | — | — | FP8 |
+| Thinker-only | — | — | AutoRound INT4 |
+| Thinker-Talker | Disaggregated | TP=1 | BF16 |
+| Thinker-Talker | Disaggregated | TP=1 | FP8 |
+| Thinker-Talker | Disaggregated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav |
+| Thinker-Talker | Disaggregated | TP=2 | BF16 |
+| Thinker-Talker | Disaggregated | TP=2 | FP8 |
+| Thinker-Talker | Disaggregated | TP=2 | AutoRound INT4 thinker + BF16 talker/code2wav |
+| Thinker-Talker | Colocated | TP=1 | BF16 |
+| Thinker-Talker | Colocated | TP=1 | FP8 |
+| Thinker-Talker | Colocated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav |
 
 ## Input / Output Modalities
 
