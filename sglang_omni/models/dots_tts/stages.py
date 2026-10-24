@@ -9,7 +9,7 @@ import math
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -536,13 +536,27 @@ def create_vocoder_executor(
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
     stream_slots: int = 16,
+    npu_decoder_precision: Literal["float32", "float16"] = "float32",
 ) -> DotsTTSStreamingVocoder:
     concrete_device = resolve_concrete_device(device, gpu_id)
     if concrete_device.type == "cpu":
         raise RuntimeError("dots.tts requires an accelerator")
     else:
         pass
-    codec = load_dots_audio_codec(model_path, device=str(concrete_device))
+    if npu_decoder_precision not in {"float32", "float16"}:
+        raise ValueError(f"Unsupported NPU decoder precision: {npu_decoder_precision}")
+    elif npu_decoder_precision == "float16" and (
+        not current_platform.is_npu()
+        or concrete_device.type != current_platform.device_type
+    ):
+        raise ValueError("NPU decoder precision requires an NPU vocoder worker")
+    else:
+        pass
+    codec = load_dots_audio_codec(
+        model_path,
+        device=str(concrete_device),
+        decoder_dtype=torch.float16 if npu_decoder_precision == "float16" else None,
+    )
     vocoder = DotsTTSStreamingVocoder(
         codec,
         optimize=optimize,

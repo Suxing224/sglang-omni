@@ -98,7 +98,7 @@ sgl-omni serve \
 
 Select an available device before starting the service. The recipe retains 16 concurrent requests, four solver steps, and a maximum of 500 generated patches. Reference encoding, latent generation, and waveform decoding run in separate processes. Reference convolution precision is process-wide, so keep the reference worker separate from the vocoder.
 
-The backbone uses the framework's NPU decode graph. Acoustic-tail and streaming-vocoder computation use the existing eager paths, without convolution caching or FP16 decoder conversion. The vocoder retains the original four-patch merge behavior. The 55 GiB stage reservations are placement accounting, not enforced allocator limits; the backbone KV cache has a separate 2 GiB budget.
+The backbone uses the framework's NPU decode graph. Acoustic-tail and streaming-vocoder computation use the existing eager paths without convolution caching. The NPU recipe sets `npu_decoder_precision: float16` for the AudioVAE decoder; reference encoding, the projection, and the LSTM remain FP32. Set this option to `float32` to keep the original decoder precision. The vocoder retains the original four-patch merge behavior. The 55 GiB stage reservations are placement accounting, not enforced allocator limits; the backbone KV cache has a separate 2 GiB budget.
 
 ## Synthesizing Speech
 

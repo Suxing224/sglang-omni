@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import MethodType
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang_omni.models.dots_tts.compat import import_dots_tts
@@ -13,6 +14,12 @@ from sglang_omni.models.dots_tts.compat import import_dots_tts
 import_dots_tts()
 
 from dots_tts.modules.vocoder.alias_free_resample import UpSample1d
+
+
+def decoder_forward(module: nn.Module, latents: torch.Tensor) -> torch.Tensor:
+    """Keep decoder precision separate from the FP32 projection and LSTM."""
+    decoder_dtype = next(module.parameters()).dtype
+    return type(module).forward(module, latents.to(dtype=decoder_dtype)).float()
 
 
 def upsample_forward(module: UpSample1d, waveform: torch.Tensor) -> torch.Tensor:

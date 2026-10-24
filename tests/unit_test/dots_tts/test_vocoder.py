@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from types import SimpleNamespace
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import sglang_omni.models.dots_tts.codec as codec_module
 from sglang_omni.models.dots_tts.compat import import_dots_tts
-from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_upsampling
+from sglang_omni.models.dots_tts.npu_vocoder import (
+    adapt_audio_vae_upsampling,
+    decoder_forward,
+)
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.vocoder import (
     DotsTTSBatchVocoder,
@@ -291,3 +296,54 @@ class TestVocoderFactorySignature:
             stage_name="vocoder",
         )
         assert out == {"stream_slots": 8, "enable_streaming_audio_vae_cuda_graph": True}
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+def test_decoder_precision_adapter_casts_input_and_preserves_checkpoint(
+    input_dtype: torch.dtype,
+) -> None:
+    decoder = torch.nn.Conv1d(4, 2, 3).half().eval()
+    latent_frames = torch.randn(2, 4, 12).to(dtype=input_dtype)
+    expected = decoder(latent_frames.half()).float()
+    state_keys = tuple(decoder.state_dict())
+    decoder.forward = MethodType(decoder_forward, decoder)
+    actual = decoder(latent_frames)
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+    assert type(decoder) is torch.nn.Conv1d
+    assert tuple(decoder.state_dict()) == state_keys
+
+
+class DecoderPrecisionCodec:
+    def __init__(self, checkpoint: str, *, device: str) -> None:
+        self.checkpoint: str = checkpoint
+        self.device: torch.device = torch.device(device)
+        self.vocoder: SimpleNamespace = SimpleNamespace(
+            decoder=torch.nn.Conv1d(4, 2, 3),
+            post_proj=torch.nn.Conv1d(4, 4, 1),
+        )
+
+
+def test_codec_cache_keeps_decoder_precisions_independent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codec_module, "resolve_checkpoint", str)
+    monkeypatch.setattr(codec_module, "DotsAudioCodec", DecoderPrecisionCodec)
+    monkeypatch.setattr(codec_module, "_CODEC_CACHE", {})
+    reference = codec_module.load_dots_audio_codec(str(tmp_path), device="cpu")
+    candidate = codec_module.load_dots_audio_codec(
+        str(tmp_path), device="cpu", decoder_dtype=torch.float16
+    )
+    assert reference is not candidate
+    assert reference.vocoder.decoder.weight.dtype == torch.float32
+    assert candidate.vocoder.decoder.weight.dtype == torch.float16
+    assert candidate.vocoder.post_proj.weight.dtype == torch.float32
+    assert codec_module.load_dots_audio_codec(str(tmp_path), device="cpu") is reference
+    assert (
+        codec_module.load_dots_audio_codec(
+            str(tmp_path), device="cpu", decoder_dtype=torch.float16
+        )
+        is candidate
+    )
+    output = candidate.vocoder.decoder(torch.randn(1, 4, 12))
+    assert output.dtype == torch.float32

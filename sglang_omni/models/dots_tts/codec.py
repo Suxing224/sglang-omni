@@ -9,13 +9,17 @@ import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import MethodType
 
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from sglang_omni.models.dots_tts.compat import import_dots_tts
-from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_upsampling
+from sglang_omni.models.dots_tts.npu_vocoder import (
+    adapt_audio_vae_upsampling,
+    decoder_forward,
+)
 from sglang_omni.models.dots_tts.payload_types import (
     load_dots_tts_state,
     store_dots_tts_state,
@@ -233,17 +237,26 @@ class DotsAudioCodec:
         return sampled[:, : -self.patch_size].contiguous()
 
 
-_CODEC_CACHE: dict[tuple[str, str], DotsAudioCodec] = {}
+_CODEC_CACHE: dict[tuple[str, str, torch.dtype | None], DotsAudioCodec] = {}
 _CODEC_CACHE_LOCK = threading.Lock()
 
 
-def load_dots_audio_codec(model_path: str, *, device: str) -> DotsAudioCodec:
+def load_dots_audio_codec(
+    model_path: str, *, device: str, decoder_dtype: torch.dtype | None = None
+) -> DotsAudioCodec:
     checkpoint = str(Path(resolve_checkpoint(model_path)).resolve())
-    key = (checkpoint, str(device))
+    key = (checkpoint, str(device), decoder_dtype)
     with _CODEC_CACHE_LOCK:
         codec = _CODEC_CACHE.get(key)
         if codec is None:
             codec = DotsAudioCodec(checkpoint, device=device)
+            if decoder_dtype is not None:
+                codec.vocoder.decoder.to(dtype=decoder_dtype)
+                codec.vocoder.decoder.forward = MethodType(
+                    decoder_forward, codec.vocoder.decoder
+                )
+            else:
+                pass
             _CODEC_CACHE[key] = codec
         else:
             pass
