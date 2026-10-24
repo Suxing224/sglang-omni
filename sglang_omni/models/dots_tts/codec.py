@@ -15,10 +15,12 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_upsampling
 from sglang_omni.models.dots_tts.payload_types import (
     load_dots_tts_state,
     store_dots_tts_state,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.preprocessing.cache_key import (
     hash_media_item,
     reference_path_cache_key,
@@ -66,6 +68,14 @@ class DotsAudioCodec:
         load_module(vocoder, root / "vocoder.safetensors")
         load_module(speaker, root / "speaker_encoder.safetensors")
         self.vocoder = vocoder.to(device=torch.device(device)).eval()
+        if (
+            current_platform.is_npu()
+            and self.vocoder.post_proj.weight.device.type
+            == current_platform.device_type
+        ):
+            adapt_audio_vae_upsampling(self.vocoder.decoder)
+        else:
+            pass
         self.speaker = speaker.to(device=torch.device(device)).eval()
         self.inference = VocoderInference(self.vocoder)
         self.patch_size = int(config.patch_size)

@@ -22,6 +22,7 @@ from sglang_omni.models.dots_tts.compat import import_dots_tts
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.request_builders import DotsTTSSGLangRequestData
 from sglang_omni.models.dots_tts.vocoder import DotsTTSStreamingVocoder
+from sglang_omni.platforms import current_platform
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -459,12 +460,26 @@ def create_reference_encode_executor(
     max_concurrency: int = 8,
     max_batch_size: int = 1,
     max_batch_wait_ms: float = 4.0,
+    npu_convolution_allow_hf32: bool | None = None,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     concrete_device = resolve_concrete_device(device, gpu_id)
     if concrete_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("dots.tts requires CUDA")
     else:
         pass
+    if npu_convolution_allow_hf32 is None:
+        pass
+    elif (
+        not current_platform.is_npu()
+        or concrete_device.type != current_platform.device_type
+    ):
+        raise ValueError("npu_convolution_allow_hf32 requires an NPU reference worker")
+    else:
+        device_module = torch.get_device_module(concrete_device)
+        device_module.conv.allow_hf32 = npu_convolution_allow_hf32
+        logging.getLogger(__name__).info(
+            f"dots.tts reference NPU convolution allow_hf32={device_module.conv.allow_hf32}"
+        )
     codec = load_dots_audio_codec(model_path, device=str(concrete_device))
     encoder = DotsReferenceEncoder(
         codec,

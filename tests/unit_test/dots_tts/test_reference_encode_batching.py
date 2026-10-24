@@ -15,7 +15,9 @@ import threading
 import pytest
 import torch
 
+from sglang_omni.models.dots_tts import stages
 from sglang_omni.models.dots_tts.codec import DotsAudioCodec
+from sglang_omni.platforms import current_platform
 
 HOP_SIZE = 8
 PATCH_SIZE = 4
@@ -345,6 +347,60 @@ def test_reference_executor_stop_closes_batch_worker(
     scheduler.stop()
 
     assert not encoder.service.batch_thread.is_alive()
+
+
+@pytest.mark.parametrize("npu_convolution_allow_hf32", [False, True])
+def test_reference_precision_option_rejects_cpu(
+    npu_convolution_allow_hf32: bool,
+) -> None:
+    with pytest.raises(ValueError, match="requires an NPU reference worker"):
+        stages.create_reference_encode_executor(
+            "stub", device="cpu", npu_convolution_allow_hf32=npu_convolution_allow_hf32
+        )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(current_platform.device_type != "npu", reason="requires NPU")
+@pytest.mark.parametrize(
+    "npu_convolution_allow_hf32,initial_precision",
+    [(None, True), (None, False), (False, True), (True, False)],
+)
+def test_reference_precision_is_configured_before_codec_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    npu_convolution_allow_hf32: bool | None,
+    initial_precision: bool,
+) -> None:
+    device_module = torch.get_device_module("npu")
+    if not device_module.is_available():
+        pytest.skip("NPU is unavailable")
+    else:
+        pass
+    codec = make_codec()
+    codec.device = torch.device("npu", device_module.current_device())
+    monkeypatch.setattr(device_module.conv, "allow_hf32", initial_precision)
+    expected_precision = (
+        initial_precision
+        if npu_convolution_allow_hf32 is None
+        else npu_convolution_allow_hf32
+    )
+
+    def load_codec(model_path: str, *, device: str) -> DotsAudioCodec:
+        assert model_path == "stub"
+        assert device == str(codec.device)
+        assert device_module.conv.allow_hf32 == expected_precision
+        return codec
+
+    monkeypatch.setattr(stages, "load_dots_audio_codec", load_codec)
+    scheduler = stages.create_reference_encode_executor(
+        "stub",
+        device="npu",
+        gpu_id=codec.device.index,
+        npu_convolution_allow_hf32=npu_convolution_allow_hf32,
+    )
+    try:
+        assert scheduler.fn.__self__.codec is codec
+    finally:
+        scheduler.stop()
 
 
 # --------------------------------------------------------------------------

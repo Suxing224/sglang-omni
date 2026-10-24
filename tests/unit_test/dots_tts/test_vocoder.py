@@ -8,14 +8,79 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from sglang_omni.models.dots_tts.compat import import_dots_tts
+from sglang_omni.models.dots_tts.npu_vocoder import adapt_audio_vae_upsampling
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.vocoder import (
     DotsTTSBatchVocoder,
     DotsTTSStreamingVocoder,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
+
+import_dots_tts()
+
+from dots_tts.modules.vocoder.alias_free_resample import UpSample1d
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("fixed_filter", [True, False])
+def test_upsampling_preserves_filters_and_skips_zero_padding(
+    monkeypatch: pytest.MonkeyPatch, causal: bool, fixed_filter: bool
+) -> None:
+    module = UpSample1d(
+        channels=3, causal=causal, fixed_filter=fixed_filter, ratio=2, kernel_size=11
+    ).double()
+    generator = torch.Generator().manual_seed(42)
+    with torch.no_grad():
+        module.filter.copy_(torch.randn(module.filter.shape, generator=generator))
+    waveform = torch.randn(2, 3, 37, dtype=torch.float64, generator=generator)
+    expected = module(waveform)
+    parameters = dict(module.named_parameters())
+    state_keys = tuple(module.state_dict())
+    original_pad = F.pad
+
+    def checked_pad(
+        tensor: torch.Tensor, padding: tuple[int, int], *, mode: str
+    ) -> torch.Tensor:
+        assert padding != (0, 0), "zero-width replicate padding corrupts NPU audio"
+        return original_pad(tensor, padding, mode=mode)
+
+    monkeypatch.setattr(F, "pad", checked_pad)
+    adapt_audio_vae_upsampling(module)
+    torch.testing.assert_close(module(waveform), expected, rtol=0.0, atol=0.0)
+    assert tuple(module.state_dict()) == state_keys
+    assert all(
+        parameter is parameters[name] for name, parameter in module.named_parameters()
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not current_platform.is_npu(), reason="requires NPU")
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("samples", [61440, 500 * 4 * 1920])
+def test_npu_native_upsampling_preserves_long_waveforms(
+    causal: bool, samples: int
+) -> None:
+    device_module = torch.get_device_module(current_platform.device_type)
+    if not device_module.is_available():
+        pytest.skip("NPU is unavailable")
+    else:
+        pass
+    module = UpSample1d(channels=3, causal=causal, ratio=2, kernel_size=12)
+    generator = torch.Generator().manual_seed(42)
+    waveform = torch.randn(1, 3, samples, generator=generator) * 0.2
+    expected = module(waveform)
+    module.to(
+        torch.device(current_platform.device_type, device_module.current_device())
+    )
+    adapt_audio_vae_upsampling(module)
+    actual = module(waveform.to(module.filter.device)).cpu()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=3e-4)
 
 
 class FakeInference:
