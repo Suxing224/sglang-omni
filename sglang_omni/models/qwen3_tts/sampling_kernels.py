@@ -8,12 +8,24 @@ import torch
 from sglang_omni.platforms import current_platform
 
 if current_platform.is_npu():
-    from sglang_omni.models.qwen3_tts.sampling_kernels_npu import (
-        murmur_hash32_npu,
+    from sglang_omni.models.qwen3_tts.ascend_triton_kernels import murmur_hash32_npu
+    from sglang_omni.models.qwen3_tts.ascend_triton_kernels import (
+        sample_top_k_npu as sample_top_k,
+    )
+    from sglang_omni.models.qwen3_tts.ascend_triton_kernels import (
         seeded_gumbel_argmax_npu,
     )
 else:
-    pass
+
+    def sample_top_k(
+        sorted_scores: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        top_ks: torch.Tensor,
+        seeds: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return None
+
 
 if not current_platform.is_npu():
     try:
@@ -710,10 +722,8 @@ def seeded_gumbel_argmax_float32(
     if logprobs.device.type == "npu":
         return seeded_gumbel_argmax_npu(logprobs, seeds, positions)
     else:
-        pass
-
-    gumbel = seeded_gumbel_noise_float32(seeds, positions, num_cols)
-    return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
+        gumbel = seeded_gumbel_noise_float32(seeds, positions, num_cols)
+        return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
 
 
 def seeded_gumbel_noise_float32(

@@ -1,9 +1,122 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device-only seed hashing and fused sampling for Qwen3-TTS on Ascend."""
+"""Ascend Triton kernels for Qwen3-TTS attention, hashing and sampling."""
 
 import torch
 import triton
 import triton.language as tl
+
+
+# Block sizes stay constexpr because tl.arange requires static tensor shapes.
+@triton.jit(
+    do_not_specialize=[
+        "query_batch_stride",
+        "query_head_stride",
+        "key_batch_stride",
+        "key_head_stride",
+        "key_position_stride",
+        "value_batch_stride",
+        "value_head_stride",
+        "value_position_stride",
+        "length",
+    ]
+)
+def short_cache_gqa_kernel(
+    q: tl.tensor,
+    key: tl.tensor,
+    value: tl.tensor,
+    output: tl.tensor,
+    query_batch_stride: int,
+    query_head_stride: int,
+    key_batch_stride: int,
+    key_head_stride: int,
+    key_position_stride: int,
+    value_batch_stride: int,
+    value_head_stride: int,
+    value_position_stride: int,
+    length: int,
+    block: tl.constexpr,
+) -> None:
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    column = tl.arange(0, 128)
+    position = tl.arange(0, block)
+    query = tl.load(
+        q + batch * query_batch_stride + head * query_head_stride + column
+    ).to(tl.float32)
+    keys = tl.load(
+        key
+        + batch * key_batch_stride
+        + (head // 2) * key_head_stride
+        + position[:, None] * key_position_stride
+        + column[None, :],
+        position[:, None] < length,
+        other=0,
+    ).to(tl.float32)
+    scores = tl.sum(keys * query[None, :], axis=1) * (128**-0.5)
+    scores = tl.where(position < length, scores, -float("inf"))
+    scores = tl.exp(scores - tl.max(scores, axis=0))
+    weights = scores / tl.sum(scores, axis=0)
+    values = tl.load(
+        value
+        + batch * value_batch_stride
+        + (head // 2) * value_head_stride
+        + position[:, None] * value_position_stride
+        + column[None, :],
+        position[:, None] < length,
+        other=0,
+    ).to(tl.float32)
+    result = tl.sum(values * weights[:, None], axis=0)
+    tl.store(output + (batch * 16 + head) * 128 + column, result)
+
+
+def short_cache_gqa_npu(
+    q: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> torch.Tensor | None:
+    """Fuse BF16 1.7B Predictor decode: 16 query heads, 8 KV heads, head size 128.
+
+    Only single-query caches of 1-16 positions and batches up to 32 are validated;
+    other shapes use the general attention path.
+    """
+    if q.device.type != "npu":
+        return None
+    else:
+        pass
+    if (q.ndim, key.ndim) != (4, 4) or value.shape != key.shape:
+        return None
+    else:
+        pass
+    batch = q.shape[0]
+    length = key.shape[2]
+    if not (
+        0 < batch <= 32
+        and q.shape[1:] == (16, 1, 128)
+        and key.shape == (batch, 8, length, 128)
+        and 0 < length <= 16
+        and q.dtype == key.dtype == value.dtype == torch.bfloat16
+        and q.device == key.device == value.device
+        and q.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+    ):
+        return None
+    else:
+        pass
+    result = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    short_cache_gqa_kernel[(batch, 16)](
+        q,
+        key,
+        value,
+        result,
+        q.stride(0),
+        q.stride(1),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        length,
+        triton.next_power_of_2(length),
+    )
+    return result
 
 
 @triton.jit
@@ -78,7 +191,7 @@ def gumbel32_values(
     value = (value * 0xC2B2AE35).to(tl.uint32)
     value = value ^ ((value >> 16) & 0xFFFF)
     hashes = value
-    # note (cocoa): Ascend lacks uint32-to-float; both 16-bit halves convert exactly.
+    # Ascend lacks uint32-to-float; both 16-bit halves convert exactly.
     high = ((hashes >> 16) & 0xFFFF).to(tl.int32).to(tl.float32)
     low = (hashes & 0xFFFF).to(tl.int32).to(tl.float32)
     uniform = high * (1.0 / 65536.0) + low * (1.0 / 4294967296.0)
@@ -88,7 +201,7 @@ def gumbel32_values(
 
 @triton.jit
 def first_argmax(
-    scores: tl.tensor, column: tl.tensor, width: tl.constexpr, block: tl.constexpr
+    scores: tl.tensor, column: tl.tensor, width: int, block: tl.constexpr
 ) -> tl.tensor:
     maximum = tl.max(scores, axis=0)
     winner = tl.min(
@@ -100,15 +213,16 @@ def first_argmax(
     return tl.where(first_nan < width, first_nan, winner)
 
 
-@triton.jit
+# A static column stride avoids Ascend UB overflow for strided 2048-column inputs.
+@triton.jit(do_not_specialize=["row_stride", "width"])
 def gumbel_argmax_kernel(
     logprobs: tl.tensor,
     seeds: tl.tensor,
     positions: tl.tensor,
     output: tl.tensor,
-    row_stride: tl.constexpr,
+    row_stride: int,
     column_stride: tl.constexpr,
-    width: tl.constexpr,
+    width: int,
     block: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -123,7 +237,7 @@ def gumbel_argmax_kernel(
     tl.store(output + row, winner.to(tl.int64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["score_stride", "index_stride", "width"])
 def top_k_sample_kernel(
     scores: tl.tensor,
     indices: tl.tensor,
@@ -131,9 +245,9 @@ def top_k_sample_kernel(
     seeds: tl.tensor,
     positions: tl.tensor,
     output: tl.tensor,
-    score_stride: tl.constexpr,
-    index_stride: tl.constexpr,
-    width: tl.constexpr,
+    score_stride: int,
+    index_stride: int,
+    width: int,
     block: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -158,8 +272,12 @@ def sample_top_k_npu(
     top_ks: torch.Tensor,
     seeds: torch.Tensor,
     positions: torch.Tensor,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """Sample bounded sorted FP32 logits with per-row Top-K and no Top-P."""
+    if sorted_scores.device.type != "npu":
+        return None
+    else:
+        pass
     seeds = seeds.to(torch.int64).contiguous().view(torch.int32)
     positions = positions.to(torch.int64).contiguous().view(torch.int32)
     batch_size, width = sorted_scores.shape

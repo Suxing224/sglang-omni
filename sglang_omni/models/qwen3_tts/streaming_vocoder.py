@@ -3211,7 +3211,10 @@ class Qwen3TTSStreamingVocoderScheduler(
             self.run_followup_batch(batch)
 
     def activate_decode_worker(self, stream: torch.Stream | None) -> None:
-        """Bind a background decode worker to the scheduler's device."""
+        """Set the thread-local NPU device before decoding; workers do not inherit it.
+
+        This prevents allocations or stream operations from using the default device.
+        """
         if self.device.type == "npu":
             current_platform.set_device(self.device)
         else:

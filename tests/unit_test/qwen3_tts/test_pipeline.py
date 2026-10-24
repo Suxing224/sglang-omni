@@ -48,6 +48,7 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
 )
 from sglang_omni.models.qwen3_tts import config as qwen3_tts_config
+from sglang_omni.models.qwen3_tts import engine_builder as qwen3_engine_builder
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
@@ -748,6 +749,49 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     assert "cuda_graph_bs_prefill" not in overrides
     assert "cuda_graph_max_bs_prefill" not in overrides
     assert overrides["disable_cuda_graph"] is False
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_allocator_preparation_uses_resolved_pool_and_request_limit(
+    monkeypatch: pytest.MonkeyPatch, is_npu: bool
+) -> None:
+    """Prepare allocator kernels before serving, only for the NPU runtime."""
+    allocator = SimpleNamespace(page_size=128)
+    prepared: list[tuple[SimpleNamespace, int, int]] = []
+
+    def prepare(
+        pool: SimpleNamespace, max_running_requests: int, vocab_size: int
+    ) -> None:
+        prepared.append((pool, max_running_requests, vocab_size))
+
+    monkeypatch.setattr(qwen3_engine_builder.current_platform, "is_npu", lambda: is_npu)
+    monkeypatch.setattr(
+        qwen3_engine_builder, "prepare_npu_kernels", prepare, raising=False
+    )
+    monkeypatch.setattr(
+        qwen3_engine_builder,
+        "get_schedule",
+        lambda: SimpleNamespace(max_running_requests=17, mem_fraction_static=0.6),
+    )
+    monkeypatch.setattr(
+        qwen3_engine_builder, "get_model", lambda: SimpleNamespace(context_length=8192)
+    )
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        max_total_num_tokens=8192,
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(vocab_size=3072),
+                token_to_kv_pool=SimpleNamespace(
+                    get_kv_size_bytes=lambda: (1024, 1024)
+                ),
+            )
+        ),
+    )
+
+    Qwen3TtsEngineBuilder().post_scheduler_setup(scheduler, None)
+
+    assert prepared == ([(allocator, 17, 3072)] if is_npu else [])
 
 
 def resolved_qwen3_tts_server_args(
@@ -8834,6 +8878,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     events: list[str] = []
 
     class FakeModel:
+        vocab_size = 3072
         model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
         speaker_encoder_graph_runner = None
 

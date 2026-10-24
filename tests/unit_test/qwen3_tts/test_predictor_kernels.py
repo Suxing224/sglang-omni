@@ -81,7 +81,7 @@ def test_predictor_npu_fused_attention_matches_sdpa(
 
 
 @pytest.mark.skipif(not current_platform.is_npu(), reason="requires Ascend NPU")
-@pytest.mark.parametrize("batch,length", [(1, 1), (8, 5), (16, 16), (32, 9)])
+@pytest.mark.parametrize("batch,length", [(1, 1), (8, 5), (8, 6), (16, 16), (32, 9)])
 def test_predictor_short_cache_gqa_matches_float32_reference(
     batch: int, length: int
 ) -> None:
@@ -152,6 +152,20 @@ def test_predictor_short_cache_graph_replay_and_fallback() -> None:
         short_cache_gqa_npu(query[:, :8], key.transpose(1, 2), value.transpose(1, 2))
         is None
     )
+
+
+@pytest.mark.skipif(not current_platform.is_npu(), reason="requires Ascend NPU")
+@pytest.mark.parametrize("invalid_tensor", ["query", "key"])
+def test_predictor_short_cache_rejects_one_non_4d_tensor(invalid_tensor: str) -> None:
+    """A single malformed query or cache must fall back before indexing shapes."""
+    query = torch.zeros(1, 16, 1, 128, device="npu", dtype=torch.bfloat16)
+    key = torch.zeros(1, 8, 4, 128, device="npu", dtype=torch.bfloat16)
+    if invalid_tensor == "query":
+        query = query.flatten()[0]
+    else:
+        key = key.flatten(0, 2)
+    value = torch.zeros_like(key)
+    assert short_cache_gqa_npu(query, key, value) is None
 
 
 def test_gather_codec_embedding_and_add_cpu_falls_back_without_writes():
