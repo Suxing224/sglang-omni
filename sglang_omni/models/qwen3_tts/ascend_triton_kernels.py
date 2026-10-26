@@ -130,6 +130,25 @@ def mix32(value: tl.tensor, key: tl.tensor) -> tl.tensor:
     return (value * 5 + 0xE6546B64).to(tl.uint32)
 
 
+@triton.jit
+def hash32_values(
+    seeds: tl.tensor, positions: tl.tensor, row: tl.tensor, column: tl.tensor
+) -> tl.tensor:
+    low = tl.load(seeds + row * 2).to(tl.uint32, bitcast=True)
+    high = tl.load(seeds + row * 2 + 1).to(tl.uint32, bitcast=True)
+    position = tl.load(positions + row * 2).to(tl.uint32, bitcast=True)
+    value = tl.full(column.shape, 0, tl.uint32)
+    value = mix32(value, low)
+    value = mix32(value, high)
+    value = mix32(value, position)
+    value = mix32(value, column.to(tl.uint32)) ^ 16
+    value = value ^ ((value >> 16) & 0xFFFF)
+    value = (value * 0x85EBCA6B).to(tl.uint32)
+    value = value ^ ((value >> 13) & 0x7FFFF)
+    value = (value * 0xC2B2AE35).to(tl.uint32)
+    return value ^ ((value >> 16) & 0xFFFF)
+
+
 @triton.jit(do_not_specialize=["width"])
 def hash32_kernel(
     seeds: tl.tensor,
@@ -140,19 +159,7 @@ def hash32_kernel(
 ) -> None:
     row = tl.program_id(0)
     column = tl.program_id(1) * block + tl.arange(0, block)
-    low = tl.load(seeds + row * 2).to(tl.uint32, bitcast=True)
-    high = tl.load(seeds + row * 2 + 1).to(tl.uint32, bitcast=True)
-    position = tl.load(positions + row * 2).to(tl.uint32, bitcast=True)
-    value = tl.full((block,), 0, tl.uint32)
-    value = mix32(value, low)
-    value = mix32(value, high)
-    value = mix32(value, position)
-    value = mix32(value, column.to(tl.uint32)) ^ 16
-    value = value ^ ((value >> 16) & 0xFFFF)
-    value = (value * 0x85EBCA6B).to(tl.uint32)
-    value = value ^ ((value >> 13) & 0x7FFFF)
-    value = (value * 0xC2B2AE35).to(tl.uint32)
-    value = value ^ ((value >> 16) & 0xFFFF)
+    value = hash32_values(seeds, positions, row, column)
     tl.store(
         output + row * width + column, value.to(tl.int64) & 0xFFFFFFFF, column < width
     )
@@ -177,20 +184,7 @@ def murmur_hash32_npu(
 def gumbel32_values(
     seeds: tl.tensor, positions: tl.tensor, row: tl.tensor, column: tl.tensor
 ) -> tl.tensor:
-    low = tl.load(seeds + row * 2).to(tl.uint32, bitcast=True)
-    high = tl.load(seeds + row * 2 + 1).to(tl.uint32, bitcast=True)
-    position = tl.load(positions + row * 2).to(tl.uint32, bitcast=True)
-    value = tl.full(column.shape, 0, tl.uint32)
-    value = mix32(value, low)
-    value = mix32(value, high)
-    value = mix32(value, position)
-    value = mix32(value, column.to(tl.uint32)) ^ 16
-    value = value ^ ((value >> 16) & 0xFFFF)
-    value = (value * 0x85EBCA6B).to(tl.uint32)
-    value = value ^ ((value >> 13) & 0x7FFFF)
-    value = (value * 0xC2B2AE35).to(tl.uint32)
-    value = value ^ ((value >> 16) & 0xFFFF)
-    hashes = value
+    hashes = hash32_values(seeds, positions, row, column)
     # Ascend lacks uint32-to-float; both 16-bit halves convert exactly.
     high = ((hashes >> 16) & 0xFFFF).to(tl.int32).to(tl.float32)
     low = (hashes & 0xFFFF).to(tl.int32).to(tl.float32)

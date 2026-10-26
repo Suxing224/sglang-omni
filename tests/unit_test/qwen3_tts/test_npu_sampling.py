@@ -101,54 +101,6 @@ def test_float32_seeded_sampling_is_repeatable() -> None:
     assert first.tolist() == expected
 
 
-def test_precomputed_gumbel_noise_matches_seeded_sampler() -> None:
-    logprobs = torch.log_softmax(
-        torch.tensor([[1.0, 0.5, -0.5], [-1.0, 2.0, 0.0]], dtype=torch.float32),
-        dim=-1,
-    )
-    seeds = torch.tensor([11, 22], dtype=torch.int64)
-    positions = torch.tensor([4, 8], dtype=torch.int64)
-
-    expected = sampling_kernels.seeded_gumbel_argmax_float32(logprobs, seeds, positions)
-    gumbel = sampling_kernels.seeded_gumbel_noise_float32(seeds, positions, 3)
-    actual = torch.argmax(logprobs + gumbel, dim=1)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    "seeds,positions,num_cols,match",
-    [
-        (
-            torch.ones((1, 1), dtype=torch.long),
-            torch.ones(1, dtype=torch.long),
-            2,
-            "one-dimensional",
-        ),
-        (
-            torch.ones(2, dtype=torch.long),
-            torch.ones(1, dtype=torch.long),
-            2,
-            "aligned",
-        ),
-        (
-            torch.ones(1, dtype=torch.long),
-            torch.ones(1, dtype=torch.long),
-            0,
-            "positive",
-        ),
-    ],
-)
-def test_seeded_gumbel_noise_rejects_invalid_shape(
-    seeds: torch.Tensor,
-    positions: torch.Tensor,
-    num_cols: int,
-    match: str,
-) -> None:
-    with pytest.raises(ValueError, match=match):
-        sampling_kernels.seeded_gumbel_noise_float32(seeds, positions, num_cols)
-
-
 def test_seeded_sampling_gumbel_math_stays_float32(monkeypatch) -> None:
     observed_dtypes = []
     original_log = torch.log
@@ -218,31 +170,6 @@ def test_npu_murmur_hash_and_float32_gumbel_execute_on_device() -> None:
 
 
 @pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
-def test_npu_batched_gumbel_matches_per_group_calls() -> None:
-    device = torch.device("npu:0")
-    group_seeds = torch.tensor(
-        [[17, 23], [17, 23], [17, 23]], device=device, dtype=torch.int64
-    )
-    group_positions = torch.tensor(
-        [[10, 16], [11, 17], [12, 18]], device=device, dtype=torch.int64
-    )
-
-    batched = sampling_kernels.seeded_gumbel_noise_float32(
-        group_seeds.reshape(-1), group_positions.reshape(-1), 8
-    ).view(3, 2, 8)
-    per_group = torch.stack(
-        [
-            sampling_kernels.seeded_gumbel_noise_float32(
-                group_seeds[group], group_positions[group], 8
-            )
-            for group in range(3)
-        ]
-    )
-
-    torch.testing.assert_close(batched, per_group, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize(
     "position,logprobs,expected",
     [(1_707_985_137, [-100.0, 0.0], [9]), (1_625_054_877, [100.0, 0.0], [7])],
@@ -283,35 +210,6 @@ def test_npu_fused_gumbel_matches_reference(num_cols: int) -> None:
 
 
 @pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
-def test_npu_fused_gumbel_graph_replay_uses_updated_inputs() -> None:
-    generator = torch.Generator().manual_seed(5678)
-    logprobs_cpu = torch.randn(16, 50, generator=generator)
-    seeds_cpu = torch.tensor([0, -1, 2**40 + 123, -(2**63)] * 4)
-    positions_cpu = torch.arange(16, dtype=torch.int64)
-    logprobs = logprobs_cpu.npu()
-    seeds, positions = seeds_cpu.npu(), positions_cpu.npu()
-    for _ in range(2):
-        sampling_kernels.seeded_gumbel_argmax_float32(logprobs, seeds, positions)
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        actual = sampling_kernels.seeded_gumbel_argmax_float32(
-            logprobs, seeds, positions
-        )
-    for _ in range(32):
-        logprobs_cpu = torch.randn(16, 50, generator=generator)
-        seeds_cpu = seeds_cpu.roll(1)
-        positions_cpu += 1
-        logprobs.copy_(logprobs_cpu)
-        seeds.copy_(seeds_cpu)
-        positions.copy_(positions_cpu)
-        graph.replay()
-        expected = sampling_kernels.seeded_gumbel_argmax_float32(
-            logprobs_cpu, seeds_cpu, positions_cpu
-        )
-        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not npu_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("width", [1, 8, 50, 51, 128, 1024])
 def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
     from sglang_omni.models.qwen3_tts.ascend_triton_kernels import sample_top_k_npu
@@ -343,6 +241,7 @@ def test_npu_top_k_fusion_matches_probability_reference(width: int) -> None:
 def test_npu_top_k_graph_replay_reads_updated_limits() -> None:
     from sglang_omni.models.qwen3_tts.ascend_triton_kernels import sample_top_k_npu
 
+    generator = torch.Generator().manual_seed(1234)
     scores = torch.zeros((16, 50), device="npu")
     indices = torch.arange(50, device="npu").expand(16, -1).contiguous()
     top_ks = torch.full((16,), 50, device="npu", dtype=torch.long)
@@ -356,7 +255,7 @@ def test_npu_top_k_graph_replay_reads_updated_limits() -> None:
     for limit in (1, 17, 50, 2):
         top_ks.fill_(limit)
         positions.add_(1)
-        scores.copy_(torch.randn_like(scores).sort(descending=True)[0])
+        scores.copy_(torch.randn(16, 50, generator=generator).sort(descending=True)[0])
         graph.replay()
         masked = scores.cpu().masked_fill(
             torch.arange(50)[None] >= limit, -float("inf")

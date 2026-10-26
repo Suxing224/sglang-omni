@@ -770,34 +770,12 @@ def seeded_gumbel_argmax_float32(
     if logprobs.device.type == "npu":
         return seeded_gumbel_argmax_npu(logprobs, seeds, positions)
     else:
-        gumbel = seeded_gumbel_noise_float32(seeds, positions, num_cols)
+        hashes = murmur_hash32_pytorch(seeds, positions, num_cols)
+        uniform = hashes.to(dtype=torch.float32) / float(_UINT32_MASK)
+        # UINT32_MAX rounds to 1.0 in float32; clamp both log boundaries.
+        uniform.clamp_(min=torch.finfo(torch.float32).tiny, max=1.0 - 2.0**-24)
+        gumbel = -torch.log(-torch.log(uniform))
         return torch.argmax(logprobs.to(dtype=torch.float32) + gumbel, dim=1)
-
-
-def seeded_gumbel_noise_float32(
-    seeds: torch.Tensor,
-    positions: torch.Tensor,
-    num_cols: int,
-) -> torch.Tensor:
-    """Build deterministic Gumbel noise without float64 device operations."""
-    if seeds.ndim != 1 or positions.shape != seeds.shape:
-        raise ValueError("seeds and positions must be one-dimensional and aligned")
-    else:
-        pass
-    if num_cols <= 0:
-        raise ValueError("num_cols must be positive")
-    else:
-        pass
-
-    hashes = murmur_hash32_pytorch(seeds, positions, num_cols)
-    uniform = hashes.to(dtype=torch.float32) / float(_UINT32_MASK)
-    # 0 and UINT32_MAX are valid hashes. Keep both away from log boundaries;
-    # UINT32_MAX rounds to 1.0 after conversion to float32.
-    uniform.clamp_(
-        min=torch.finfo(torch.float32).tiny,
-        max=1.0 - 2.0**-24,
-    )
-    return -torch.log(-torch.log(uniform))
 
 
 def sample_from_logprobs_with_seed_npu(

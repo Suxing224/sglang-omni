@@ -144,12 +144,16 @@ def test_predictor_short_cache_graph_replay_and_fallback() -> None:
     )
     assert (
         short_cache_gqa_npu(
-            query.float(), key.transpose(1, 2).float(), value.transpose(1, 2).float()
+            query.float(),
+            key[:, :7].transpose(1, 2).float(),
+            value[:, :7].transpose(1, 2).float(),
         )
         is None
     )
     assert (
-        short_cache_gqa_npu(query[:, :8], key.transpose(1, 2), value.transpose(1, 2))
+        short_cache_gqa_npu(
+            query[:, :8], key[:, :7].transpose(1, 2), value[:, :7].transpose(1, 2)
+        )
         is None
     )
 
