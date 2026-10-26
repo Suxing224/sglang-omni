@@ -51,7 +51,7 @@ from sglang_omni.scheduling.speaker_cache import (
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.scheduling.types import RequestOutput
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
-from sglang_omni.utils.device import supports_device_streams
+from sglang_omni.utils.device import has_device_streams, supports_device_streams
 
 logger = logging.getLogger(__name__)
 
@@ -1085,6 +1085,12 @@ class Qwen3TTSRefCodeBatcher:
         return codes[0, :, :frames].transpose(0, 1)
 
     def run(self) -> None:
+        if self.encode_stream is not None:
+            # note (ratish): a new thread starts on device 0, and leaving the encode
+            # stream switches it back there, which opens a context on that card.
+            torch.get_device_module(self.encoder_device).set_device(self.encoder_device)
+        else:
+            pass
         while True:
             raw_batch, shutdown = self.drain()
             if not raw_batch:
@@ -1599,6 +1605,18 @@ def prepare_qwen3_tts_request(
     )
 
 
+def bind_preprocessing_thread_device() -> None:
+    """Pin a preprocessing pool thread to the device of the preprocessing stream."""
+    with _PREPARED_REQUESTS_LOCK:
+        context = _PREPROCESSING_CONTEXT
+    if context is not None and context.stream is not None:
+        # note (ratish): a pool thread starts on device 0, and leaving the stream
+        # switches it back there, which opens a context on that card.
+        torch.get_device_module(context.stream.device).set_device(context.stream.device)
+    else:
+        pass
+
+
 def preprocess_qwen3_tts_payload(
     payload: StagePayload, *, default_stream_codec_output: bool = True
 ) -> StagePayload:
@@ -1989,7 +2007,7 @@ def make_qwen3_tts_scheduler_adapters(
                 codes = torch.cat((ref_code, codes), dim=0)
                 # note (luojiaxuan): the step's ready event was recorded before
                 # this cat, so the prefixed chunk needs its own.
-                if supports_device_streams(codes.device):
+                if has_device_streams(codes.device):
                     data.codes_ready_event = torch.get_device_module(
                         codes.device
                     ).Event()
