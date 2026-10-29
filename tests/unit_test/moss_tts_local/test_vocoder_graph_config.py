@@ -33,7 +33,7 @@ def test_npu_recipe_keeps_frame_graphs_without_backbone_graphs() -> None:
         16,
     ]
     assert engine["attention_backend"] == "ascend"
-    assert config.stage_factory_kwargs("vocoder")["vocoder_cuda_graph"] is False
+    assert config.stage_factory_kwargs("vocoder")["vocoder_cuda_graph"] is True
 
 
 @pytest.mark.parametrize(
