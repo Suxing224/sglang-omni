@@ -26,7 +26,7 @@ stages:
       max_concurrency: 8
       max_batch_size: 1
       max_batch_wait_ms: 4
-      npu_convolution_allow_hf32: false
+      reference_convolution_allow_reduced_precision: false
   latent_engine:
     process: latent
     total_reserve_bytes: 40GiB

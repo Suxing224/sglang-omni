@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -412,7 +411,7 @@ def batched_causal_update_mask(
 
 
 def rotary_cos_sin(
-    rotary: Callable[[torch.Tensor], torch.Tensor], starts: torch.Tensor, length: int
+    rotary: RotaryEmbedding, starts: torch.Tensor, length: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-slot-start form of
     ``dots_tts.modules.backbone.inference_utils.build_rotary_cos_sin``."""

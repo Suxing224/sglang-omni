@@ -460,25 +460,34 @@ def create_reference_encode_executor(
     max_concurrency: int = 8,
     max_batch_size: int = 1,
     max_batch_wait_ms: float = 4.0,
-    npu_convolution_allow_hf32: bool | None = None,
+    reference_convolution_allow_reduced_precision: bool | None = None,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     concrete_device = resolve_concrete_device(device, gpu_id)
     if concrete_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("dots.tts requires CUDA")
     else:
         pass
-    if npu_convolution_allow_hf32 is None:
+    if reference_convolution_allow_reduced_precision is None:
         pass
-    elif (
-        not current_platform.is_npu()
-        or concrete_device.type != current_platform.device_type
+    elif concrete_device.type != current_platform.device_type or not (
+        current_platform.is_npu() or current_platform.is_cuda()
     ):
-        raise ValueError("npu_convolution_allow_hf32 requires an NPU reference worker")
+        raise ValueError(
+            "reference_convolution_allow_reduced_precision requires a CUDA or NPU reference worker"
+        )
     else:
-        device_module = torch.get_device_module(concrete_device)
-        device_module.conv.allow_hf32 = npu_convolution_allow_hf32
+        if current_platform.is_npu():
+            device_module = torch.get_device_module(concrete_device)
+            device_module.conv.allow_hf32 = (
+                reference_convolution_allow_reduced_precision
+            )
+        else:
+            torch.backends.cudnn.allow_tf32 = (
+                reference_convolution_allow_reduced_precision
+            )
         logging.getLogger(__name__).info(
-            f"dots.tts reference NPU convolution allow_hf32={device_module.conv.allow_hf32}"
+            f"dots.tts reference convolution allow_reduced_precision="
+            f"{reference_convolution_allow_reduced_precision} (device={concrete_device})"
         )
     codec = load_dots_audio_codec(model_path, device=str(concrete_device))
     encoder = DotsReferenceEncoder(
