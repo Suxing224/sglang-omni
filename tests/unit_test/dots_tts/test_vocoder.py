@@ -12,11 +12,11 @@ import torch
 import torch.nn.functional as F
 
 import sglang_omni.models.dots_tts.codec as codec_module
-from sglang_omni.models.dots_tts.compat import import_dots_tts
-from sglang_omni.models.dots_tts.npu_vocoder import (
+from sglang_omni.models.dots_tts.codec import (
     adapt_audio_vae_upsampling,
     decoder_forward,
 )
+from sglang_omni.models.dots_tts.compat import import_dots_tts
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.vocoder import (
     DotsTTSBatchVocoder,
